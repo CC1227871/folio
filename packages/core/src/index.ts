@@ -6,6 +6,8 @@ export type { SupportedLocale, LocalePreference } from './locale.ts';
 
 export interface Quote {
   symbol: string;
+  /** Folio canonical instrument id when the quote was resolved through the catalog. */
+  instrumentId?: string;
   lastPrice: number;
   change: number;
   changePercent: number;
@@ -61,11 +63,15 @@ export interface NewsItem {
   url: string;
   timestamp: number;
   symbols: string[];
+  /** Folio canonical instrument id when news was fetched for a resolved listing. */
+  instrumentId?: string;
 }
 
 /** Static reference info for a security. */
 export interface StaticInfo {
   symbol: string;
+  /** Folio canonical instrument id when profile data was resolved through the catalog. */
+  instrumentId?: string;
   name: string;
   exchange?: string;
   currency?: string;
@@ -81,6 +87,7 @@ export interface StaticInfo {
 /** Calculated financial indexes (PE, PB, dividend yield, market value…). */
 export interface CalcIndex {
   symbol: string;
+  instrumentId?: string;
   pe?: number;
   pb?: number;
   dpsRate?: number;
@@ -196,6 +203,19 @@ export interface Message {
 
 export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 
+/**
+ * Why a run stopped. `completed` is the only success value: a run cut short by a
+ * budget or a runaway loop is not an ordinary answer, so telemetry, evaluation
+ * and the UI branch on this instead of treating every terminal run as success.
+ */
+export type StopReason =
+  | 'completed'
+  | 'budget_exhausted'
+  | 'loop_detected'
+  | 'retry_storm'
+  | 'cancelled'
+  | 'error';
+
 /** One agent execution inside a session. */
 export interface Run {
   id: string;
@@ -223,6 +243,10 @@ export interface Run {
   runtimeAssistantEntryId?: string;
   /** Immutable run manifest for audit/evaluation consumers. */
   manifest?: RunManifest;
+  /** Machine-readable reason the run stopped; absent on records written before #17. */
+  stopReason?: StopReason;
+  /** The numbers behind a non-success stop (which budget ran out, which loop fired). */
+  stopDetail?: Record<string, unknown>;
 }
 
 export interface RunManifest {
@@ -298,6 +322,8 @@ export interface ToolResultProvenance {
   fetchedAt: number;
   marketTime?: number;
   stale?: boolean;
+  /** Canonical instrument id when the tool ran against a resolved listing. */
+  instrumentId?: string;
 }
 
 /** Structured tool result: raw data plus optional provenance. */
@@ -648,6 +674,7 @@ export interface Skill {
 }
 
 // ── Folio V3 domains ───────────────────────────────────────────────────────
+export * from './answer-blocks.ts';
 export * from './capability.ts';
 export * from './research.ts';
 export * from './thesis.ts';
@@ -671,3 +698,5 @@ export * from './evaluation.ts';
 export * from './locale.ts';
 export * from './trace.ts';
 export * from './trace-projection.ts';
+export * from './instrument.ts';
+export * from './instrument-catalog.ts';

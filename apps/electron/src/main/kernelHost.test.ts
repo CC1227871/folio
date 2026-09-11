@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { join } from 'node:path';
 import type { AgentEvent } from '@finagent/core';
 
 let lastKernelOptions: Record<string, unknown> | null = null;
 let lastMarketData: FakeMarketDataService | null = null;
 let forwardedEvents: unknown[] = [];
+const routerFetchers = { getQuote: async () => ({ symbol: 'AAPL.US' }) };
 
 class FakeMarketDataService {
   quoteSymbols: string[] = [];
+  constructor(readonly options?: { fetchers?: unknown }) {}
 
   async getQuote(symbol: string) {
     this.quoteSymbols.push(symbol);
@@ -95,8 +98,8 @@ const noopStore = class {
 mock.module('@finagent/shared', () => ({
   AgentKernel: FakeAgentKernel,
   MarketDataService: class extends FakeMarketDataService {
-    constructor() {
-      super();
+    constructor(options?: { fetchers?: unknown }) {
+      super(options);
       lastMarketData = this;
     }
   },
@@ -149,7 +152,13 @@ mock.module('@finagent/shared', () => ({
   computeSkillReadiness: () => undefined,
   parseSynthesisJson: (text: string) => JSON.parse(text),
   parseImpactJson: (text: string) => JSON.parse(text),
-  createRouterFetchers: () => ({}),
+  createRouterFetchers: () => routerFetchers,
+  withDemoDataFallback: (fetchers: unknown) => fetchers,
+  InstrumentCatalogStore: class {
+    load = async () => {
+      throw new Error('skip instrument catalog persist in unit tests');
+    };
+  },
   MassiveFinancialDataProvider: class {
     clearCache = () => undefined;
   },
@@ -255,6 +264,9 @@ mock.module('@finagent/shared', () => ({
       tracingEnabled: false,
       langsmithProject: 'folio-agent',
       langsmithEndpoint: '',
+      langfuseTracingEnabled: false,
+      langfuseHost: '',
+      langfuseConfigured: false,
       privacyLevel: 'standard',
       onlineEvaluationEnabled: false,
       apiKeyConfigured: false,
@@ -283,6 +295,17 @@ mock.module('@finagent/shared', () => ({
     status: async () => ({ kind: 'none', available: true }),
     findTraces: async () => [],
   }),
+  resolveLangfuseBackend: () => ({
+    kind: 'none',
+    status: async () => ({ kind: 'none', available: true }),
+    findTraces: async () => [],
+  }),
+  LangfuseEvaluationBackend: class {},
+  serializeLangfuseCredential: (publicKey: string, secretKey: string) =>
+    JSON.stringify({ publicKey, secretKey }),
+  scoresFromResearchReport: () => [],
+  scoresFromAgentRun: () => [],
+  currentFolioVersion: () => 'test',
   EvaluationRedactor: class {
     redactAnswer = (answer: string | undefined) => answer;
     redactToolCall = (toolCall: unknown) => toolCall;
@@ -329,8 +352,8 @@ describe('AgentKernelHost', () => {
     const host = new AgentKernelHost();
 
     expect(lastKernelOptions).toMatchObject({
-      storageDir: '/tmp/finagent-test/store',
-      piSessionDir: '/tmp/finagent-test/pi-sessions',
+      storageDir: join('/tmp/finagent-test', 'store'),
+      piSessionDir: join('/tmp/finagent-test', 'pi-sessions'),
     });
     host.dispose();
   });
@@ -414,6 +437,13 @@ describe('AgentKernelHost', () => {
       symbol: 'AAPL.US',
     });
     expect(lastMarketData?.quoteSymbols).toEqual(['AAPL.US']);
+    host.dispose();
+  });
+
+  it('uses the provider-router fetchers for renderer market data', () => {
+    const host = new AgentKernelHost();
+
+    expect(lastMarketData?.options?.fetchers).toBe(routerFetchers);
     host.dispose();
   });
 

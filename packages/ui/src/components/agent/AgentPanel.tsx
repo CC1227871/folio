@@ -21,7 +21,7 @@ import {
 } from '../../atoms';
 import { useFinagentClient } from '../../client';
 import { MessageList } from '../chat/MessageList';
-import { MarkdownContent } from '../chat/MarkdownContent';
+import { AnswerContent } from '../chat/AnswerContent';
 import { ModelSelector } from './ModelSelector';
 import { ThinkingSelector } from './ThinkingSelector';
 import { BranchSwitcher } from './BranchSwitcher';
@@ -106,7 +106,9 @@ export const AgentPanel: React.FC = () => {
   const [sendError, setSendError] = useState<string | null>(null);
   const [traceDialog, setTraceDialog] = useState<{ runId: string; trace: FolioTrace | null } | null>(null);
   const [traceLoading, setTraceLoading] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
   const bodyEndRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
 
   const isRunning = runView !== null && runView.infraError === undefined;
   const agentMotionState: AgentMotionState = runView?.infraError
@@ -120,8 +122,16 @@ export const AgentPanel: React.FC = () => {
           : 'idle';
 
   useEffect(() => {
+    if (!shouldAutoScrollRef.current) return;
     bodyEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, runView?.answer, runView?.toolCalls]);
+
+  const handleBodyScroll = () => {
+    const body = bodyRef.current;
+    if (!body) return;
+    const distanceFromBottom = body.scrollHeight - body.scrollTop - body.clientHeight;
+    shouldAutoScrollRef.current = distanceFromBottom <= 24;
+  };
 
   const handleSend = async () => {
     const text = input.trim();
@@ -319,7 +329,11 @@ export const AgentPanel: React.FC = () => {
       <BranchSwitcher disabled={isRunning} />
 
       {/* Scrollable body: tool activity, structured results, messages, live answer */}
-      <div className="folio-agent-body flex-1 overflow-y-auto scrollbar-hover">
+      <div
+        ref={bodyRef}
+        onScroll={handleBodyScroll}
+        className="folio-agent-body flex-1 overflow-y-auto scrollbar-hover"
+      >
         <div className="flex flex-col gap-3 p-3">
           {runView?.infraError && (
             <RuntimeInfraBanner
@@ -512,7 +526,7 @@ const StreamingBlock: React.FC<{ answer: string }> = ({ answer }) => {
         {t('agent.panel.agentRunning')}
       </div>
       {answer.length > 0 ? (
-        <MarkdownContent content={answer} className="text-[13px] text-foreground/72" />
+        <AnswerContent content={answer} streaming className="text-[13px] text-foreground/72" />
       ) : (
         <div className="text-[13px] italic text-foreground/40">{t('agent.panel.thinking')}</div>
       )}

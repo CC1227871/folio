@@ -19,6 +19,7 @@
  */
 import type { CapabilityId } from './capability.ts';
 import type { AccountAssets, CashFlowRecord, PortfolioSnapshot } from './account.ts';
+import type { InstrumentCandidateSummary } from './instrument.ts';
 
 // ── Domains ────────────────────────────────────────────────────────────────
 
@@ -73,6 +74,18 @@ export interface ProviderHealth {
   permissions?: ProviderPermission[];
   /** Last status() round-trip duration. */
   latencyMs?: number;
+  /** Stable diagnostic result from an explicit production-path probe. */
+  diagnostic?:
+    | 'missing-credential'
+    | 'authentication-failed'
+    | 'unreachable'
+    | 'rate-limited'
+    | 'partial-failure'
+    | 'healthy'
+    | 'degraded'
+    | 'unhealthy';
+  /** Safe, stable error code. Vendor responses and credentials are forbidden. */
+  diagnosticCode?: string;
 }
 
 // ── Markets / Coverage ─────────────────────────────────────────────────────
@@ -97,6 +110,10 @@ export interface ProviderCoverage {
   providerId: string;
   capabilities: CapabilityId[];
   markets: Market[];
+  /** Freshness class exposed by the provider contract. */
+  dataAccess?: 'live' | 'delayed' | 'end-of-day';
+  credentialRequirement?: 'none' | 'device-login' | 'api-key';
+  quota?: { limit: number; window: string };
 }
 
 // ── Results / Provenance / Errors ──────────────────────────────────────────
@@ -109,6 +126,8 @@ export interface ProviderCoverage {
 export interface ProviderProvenance {
   providerId: string;
   providerName: string;
+  /** Canonical instrument id when the request was bound to a catalog listing. */
+  instrumentId?: string;
   /** Epoch ms when the data was fetched. */
   fetchedAt: number;
   /** Epoch ms of the data's own market timestamp, when known. */
@@ -129,6 +148,8 @@ export interface ProviderError {
   message: string;
   /** True when an immediate retry may succeed (transient). */
   retryable?: boolean;
+  /** Listing choices when `code` is `AMBIGUOUS_INSTRUMENT`. */
+  candidates?: InstrumentCandidateSummary[];
 }
 
 export type ProviderResult<T> =

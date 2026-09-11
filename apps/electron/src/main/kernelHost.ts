@@ -65,12 +65,13 @@ import type {
   EvaluationRunStatus,
   EvaluationSettings,
   LangSmithConnectionStatus,
+  LangfuseConnectionStatus,
   PrivacyLevel,
   ToolCall,
   ToolCallRecord,
   TraceReference,
 } from '@finagent/core';
-import { STRATEGY_IDS } from '@finagent/core';
+import { DEFAULT_INSTRUMENT_CATALOG, InstrumentResolver, STRATEGY_IDS } from '@finagent/core';
 import { isLocalePreference } from '@finagent/i18n';
 import { createAppPreferencesService, type AppPreferencesService } from './app-preferences.ts';
 import {
@@ -87,6 +88,7 @@ import {
   createLocalThesisEvaluator,
   createRouterFetchers,
   ConnectionStore,
+  InstrumentCatalogStore,
   defaultPortfolioRiskSynthesizer,
   FinanceToolRegistry,
   JsonFileStore,
@@ -134,6 +136,12 @@ import {
   EvaluationStore,
   TraceCorrelationService,
   resolveBackend,
+  resolveLangfuseBackend,
+  LangfuseEvaluationBackend,
+  serializeLangfuseCredential,
+  scoresFromAgentRun,
+  scoresFromResearchReport,
+  currentFolioVersion,
   EvaluationRedactor,
   PiRuntimeAdapter,
   sanitizeSettings,
@@ -148,6 +156,7 @@ import {
   type MarketPulseSnapshot,
   type ShareCard,
   type WatchlistQuote,
+  withDemoDataFallback,
 } from '@finagent/shared';
 import {
   LongbridgeBrokerAccountProvider,
@@ -189,7 +198,15 @@ interface ConnectionEntry {
   hasAccount: boolean;
   accountLabel: string | null;
   error: { code: string; message: string } | null;
+  enabled: boolean;
+  endpoint: string | null;
+  region: string | null;
+  routingRole: 'primary' | 'fallback' | null;
+  recentResult: ReturnType<ProviderRouter['lastResultFor']> | null;
 }
+
+const MASSIVE_CREDENTIAL_ID = 'financial:massive';
+const DEFAULT_PROVIDER_ROUTING = { primary: 'longbridge', fallback: 'massive' } as const;
 
 type IpcSuccess<T> = { ok: true; data: T };
 
@@ -224,6 +241,7 @@ interface PendingEvalRun {
   startedAt: number;
   toolCalls: ToolCall[];
   answer: string;
+  input?: string;
   error?: ApiError;
 }
 
@@ -236,7 +254,7 @@ interface PendingEvalRun {
  * main process.
  */
 export class AgentKernelHost {
-  private readonly marketData = new MarketDataService();
+  private readonly marketData: MarketDataService;
   private readonly kernel: AgentKernel;
   private readonly credentials: CredentialStore;
   private readonly skillHub: SkillHub;
@@ -263,6 +281,7 @@ export class AgentKernelHost {
   private readonly portfolioRisk: PortfolioRiskService;
   private readonly connectionStore: ConnectionStore;
   private readonly providerRouter: ProviderRouter;
+  private instrumentResolver: InstrumentResolver;
   private activeLogin: { cancel: () => void } | null = null;
   private unsubscribe: (() => void) | null = null;
   private connectionsUnsubscribe: (() => void) | null = null;
@@ -275,6 +294,7 @@ export class AgentKernelHost {
   private readonly appPreferences: AppPreferencesService;
   private evaluationSettings: EvaluationSettings;
   private evaluationBackend: EvaluationBackend;
+  private langfuseBackend: LangfuseEvaluationBackend | undefined;
   private evaluationRedactor: EvaluationRedactor;
   private traceCorrelation: TraceCorrelationService;
   private readonly evalRuns = new Map<string, PendingEvalRun>();
@@ -304,18 +324,37 @@ export class AgentKernelHost {
     // (fallback) adapters. Business layers see only the neutral capability
     // surface — vendor specifics stay inside the adapters.
     this.connectionStore = new ConnectionStore(new JsonFileStore(userData));
-    this.providerRouter = new ProviderRouter();
+    this.providerRouter = new ProviderRouter({
+      resolveRouting: () => this.connectionStore.getRouting(DEFAULT_PROVIDER_ROUTING),
+      isEnabled: async (providerId) =>
+        (await this.connectionStore.getConfig(providerId))?.enabled !== false,
+    });
     const longbridgeData = new LongbridgeFinancialDataProvider();
     const longbridgeBroker = new LongbridgeBrokerAccountProvider();
     const massive = new MassiveFinancialDataProvider({
-      getApiKey: async () => (await this.connectionStore.getConfig('massive'))?.apiKey,
+      getApiKey: () => this.credentials.getCredential(MASSIVE_CREDENTIAL_ID),
+      getEndpoint: async () => (await this.connectionStore.getConfig('massive'))?.endpoint,
     });
     this.providerRouter.register(longbridgeData);
     this.providerRouter.register(longbridgeBroker);
     this.providerRouter.register(massive);
-    this.providerRouter.setRouting({ primary: 'longbridge', fallback: 'massive' });
+    this.providerRouter.setRouting(DEFAULT_PROVIDER_ROUTING);
 
-    this.registry = createFullRegistry(createRouterFetchers(this.providerRouter));
+    // Keep renderer IPC and agent tools on the same provider gateway.  The
+    // service retains its dedicated Longbridge status probe, while market-data
+    // capabilities use the router's configured primary/fallback chain.
+    this.instrumentResolver = new InstrumentResolver(DEFAULT_INSTRUMENT_CATALOG);
+    const routerFetchers = createRouterFetchers(this.providerRouter, {
+      resolve: (query, options) => this.instrumentResolver.resolve(query, options),
+    });
+    void this.hydrateInstrumentCatalog(userData);
+    // FINAGENT_DEMO_DATA=1: offline demo mode. When every real provider is
+    // unavailable, built-in sample data answers instead; every surface built
+    // on it labels its content with source 'demo' (DemoBadge).
+    const demoData = process.env.FINAGENT_DEMO_DATA === '1';
+    const capabilityFetchers = demoData ? withDemoDataFallback(routerFetchers) : routerFetchers;
+    this.marketData = new MarketDataService({ fetchers: capabilityFetchers });
+    this.registry = createFullRegistry(capabilityFetchers);
     this.executor = new CapabilityExecutor();
 
     this.researchService = new ResearchService({
@@ -329,6 +368,7 @@ export class AgentKernelHost {
         void this.outcomeService.createOpinionFromReport(report);
         void this.saveDiffForReport(report);
       },
+      onRunComplete: (result) => this.exportResearchTrace(result),
     });
 
     // V5 outcome evaluation: opinions snapshotted from reports, outcomes
@@ -390,6 +430,7 @@ export class AgentKernelHost {
       piSessionDir: join(userData, 'pi-sessions'),
       provider,
       marketData: this.marketData,
+      demoData,
       registry: new FinanceToolRegistry(this.registry),
       skillHub: this.skillHub,
       rpc: {
@@ -1004,8 +1045,13 @@ export class AgentKernelHost {
   async getEvaluationSettings(): Promise<{
     settings: EvaluationSettings;
     connection: LangSmithConnectionStatus;
+    langfuse: LangfuseConnectionStatus;
   }> {
-    return { settings: this.evaluationSettings, connection: await this.testEvaluationConnection() };
+    return {
+      settings: this.evaluationSettings,
+      connection: await this.testEvaluationConnection(),
+      langfuse: await this.testLangfuseConnection(),
+    };
   }
 
   async setEvaluationSettings(input: unknown): Promise<EvaluationSettings> {
@@ -1015,6 +1061,8 @@ export class AgentKernelHost {
       sanitized.tracingEnabled !== this.evaluationSettings.tracingEnabled ||
       sanitized.langsmithProject !== this.evaluationSettings.langsmithProject ||
       sanitized.langsmithEndpoint !== this.evaluationSettings.langsmithEndpoint ||
+      sanitized.langfuseTracingEnabled !== this.evaluationSettings.langfuseTracingEnabled ||
+      sanitized.langfuseHost !== this.evaluationSettings.langfuseHost ||
       sanitized.privacyLevel !== this.evaluationSettings.privacyLevel;
     this.evaluationSettings = sanitized;
     await this.evaluationStore.saveSettings(sanitized);
@@ -1045,6 +1093,40 @@ export class AgentKernelHost {
     this.evaluationSettings = { ...this.evaluationSettings, apiKeyConfigured: false, updatedAt: Date.now() };
     await this.evaluationStore.saveSettings(this.evaluationSettings);
     await this.refreshEvaluationBackend();
+  }
+
+  async setLangfuseCredential(input: unknown): Promise<void> {
+    const request = requireObject(input);
+    const publicKey = requireString(request.publicKey, 'publicKey');
+    const secretKey = requireString(request.secretKey, 'secretKey');
+    await this.credentials.setCredential('langfuse', serializeLangfuseCredential(publicKey, secretKey));
+    this.evaluationSettings = { ...this.evaluationSettings, langfuseConfigured: true, updatedAt: Date.now() };
+    await this.evaluationStore.saveSettings(this.evaluationSettings);
+    await this.refreshEvaluationBackend();
+  }
+
+  async removeLangfuseCredential(): Promise<void> {
+    await this.credentials.removeCredential('langfuse');
+    this.evaluationSettings = { ...this.evaluationSettings, langfuseConfigured: false, updatedAt: Date.now() };
+    await this.evaluationStore.saveSettings(this.evaluationSettings);
+    await this.refreshEvaluationBackend();
+  }
+
+  async testLangfuseConnection(): Promise<LangfuseConnectionStatus> {
+    const raw = await this.credentials.getCredential('langfuse');
+    const backend = resolveLangfuseBackend({
+      settings: { ...this.evaluationSettings, langfuseTracingEnabled: true },
+      storedCredential: raw,
+      privacyLevel: this.evaluationSettings.privacyLevel,
+    });
+    const status = await backend.status();
+    return {
+      connected: status.available,
+      configured: Boolean(raw),
+      endpoint: status.endpoint,
+      error: status.available ? undefined : status.message,
+      message: status.message,
+    };
   }
 
   async testEvaluationConnection(): Promise<LangSmithConnectionStatus> {
@@ -1136,12 +1218,14 @@ export class AgentKernelHost {
   async getEvaluationStatus(): Promise<{
     backend: EvaluationBackendKind;
     tracingEnabled: boolean;
+    langfuseTracingEnabled: boolean;
     privacyLevel: PrivacyLevel;
     project: string;
   }> {
     return {
       backend: this.evaluationBackend.kind,
       tracingEnabled: this.evaluationSettings.tracingEnabled,
+      langfuseTracingEnabled: this.evaluationSettings.langfuseTracingEnabled,
       privacyLevel: this.evaluationSettings.privacyLevel,
       project: this.evaluationSettings.langsmithProject,
     };
@@ -1161,10 +1245,17 @@ export class AgentKernelHost {
     this.kernel.runtime.setExtensions(listBundledPiExtensions(extra));
   }
 
-  /** Reload the LangSmith credential so the backend reflects storage changes. */
+  /** Reload LangSmith / Langfuse credentials so the backend reflects storage changes. */
   private async refreshEvaluationBackend(): Promise<void> {
     const key = await this.credentials.getCredential('langsmith');
-    const backend = resolveBackend(this.evaluationSettings, key);
+    const langfuseRaw = await this.credentials.getCredential('langfuse');
+    const langfuse = resolveLangfuseBackend({
+      settings: this.evaluationSettings,
+      storedCredential: langfuseRaw,
+      privacyLevel: this.evaluationSettings.privacyLevel,
+    });
+    this.langfuseBackend = langfuse instanceof LangfuseEvaluationBackend ? langfuse : undefined;
+    const backend = this.langfuseBackend ?? resolveBackend(this.evaluationSettings, key);
     this.evaluationBackend = backend;
     this.traceCorrelation = new TraceCorrelationService({
       backend,
@@ -1181,6 +1272,7 @@ export class AgentKernelHost {
         startedAt: event.timestamp,
         toolCalls: [],
         answer: '',
+        input: event.payload.userMessage?.content,
       });
       return;
     }
@@ -1191,6 +1283,7 @@ export class AgentKernelHost {
     } else if (event.type === 'message_completed') {
       pending.answer = event.payload.answer;
     } else if (event.type === 'run_completed' || event.type === 'run_failed') {
+      if (event.type === 'run_failed') pending.error = event.payload.error;
       const completed = event.type === 'run_completed';
       void this.settleEvaluationRun(event.runId, event.sessionId, completed, event.timestamp);
     }
@@ -1242,18 +1335,166 @@ export class AgentKernelHost {
     }
     const session = await this.kernel.sessions.getSession(sessionId).catch(() => undefined);
     const threadId = session?.runtimeSessionId;
-    const ref = await this.traceCorrelation.recordRun({
-      folioRunId: runId,
-      folioSessionId: sessionId,
+    let ref = await this.exportAgentTrace({
+      runId,
+      sessionId,
       threadId,
       startedAt: pending.startedAt,
       completedAt: endedAt,
+      input: pending.input,
+      answer: run.answer,
+      toolCalls: run.toolCalls,
+      error: pending.error,
+      completed,
     });
+    if (ref) {
+      await this.persistTraceLink(runId, ref);
+    } else {
+      ref = await this.traceCorrelation.recordRun({
+        folioRunId: runId,
+        folioSessionId: sessionId,
+        threadId,
+        startedAt: pending.startedAt,
+        completedAt: endedAt,
+      });
+    }
     if (ref.backend === 'none' && this.evaluationSettings.tracingEnabled) {
       mainErrorLog.push({
         at: Date.now(),
         source: 'main',
         message: 'Trace correlation: no LangSmith trace matched the finished run.',
+        stack: null,
+      });
+    }
+    if (this.evaluationSettings.langfuseTracingEnabled && !this.langfuseBackend) {
+      mainErrorLog.push({
+        at: Date.now(),
+        source: 'main',
+        message: 'Langfuse tracing is enabled but credentials are missing or the exporter failed to initialize.',
+        stack: null,
+      });
+    }
+  }
+
+  private async persistTraceLink(
+    runId: string,
+    ref: import('@finagent/core').TraceReference
+  ): Promise<void> {
+    try {
+      await this.evaluationStore.recordTraceLink({ runId, traceRef: ref, recordedAt: Date.now() });
+    } catch (error) {
+      mainErrorLog.push({
+        at: Date.now(),
+        source: 'main',
+        message: `Trace link persist failed: ${error instanceof Error ? error.message : String(error)}`,
+        stack: null,
+      });
+    }
+  }
+
+  private async exportAgentTrace(input: {
+    runId: string;
+    sessionId: string;
+    threadId?: string;
+    startedAt: number;
+    completedAt: number;
+    input?: string;
+    answer?: string;
+    toolCalls: ToolCallRecord[];
+    error?: ApiError;
+    completed: boolean;
+  }): Promise<import('@finagent/core').TraceReference | undefined> {
+    if (!this.langfuseBackend) return undefined;
+    try {
+      const ref = await this.langfuseBackend.exportAgentRun({
+        folioRunId: input.runId,
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        startedAt: input.startedAt,
+        completedAt: input.completedAt,
+        input: input.input,
+        output: input.answer,
+        toolCalls: input.toolCalls,
+        error: input.error,
+        metadata: {
+          folioRunId: input.runId,
+          folioSessionId: input.sessionId,
+          threadId: input.threadId,
+          runKind: 'normal',
+          folioVersion: currentFolioVersion(),
+        },
+      });
+      if (ref.traceId) {
+        const scores = scoresFromAgentRun({
+          completed: input.completed,
+          toolCalls: input.toolCalls,
+          latencyMs: Math.max(0, input.completedAt - input.startedAt),
+        });
+        await this.langfuseBackend.submitScores(ref.traceId, scores);
+      }
+      return ref;
+    } catch (error) {
+      mainErrorLog.push({
+        at: Date.now(),
+        source: 'main',
+        message: `Langfuse agent export failed: ${error instanceof Error ? error.message : String(error)}`,
+        stack: null,
+      });
+      return undefined;
+    }
+  }
+
+  private async exportResearchTrace(result: import('@finagent/shared').ResearchRunResult): Promise<void> {
+    if (!this.langfuseBackend) {
+      if (this.evaluationSettings.langfuseTracingEnabled) {
+        mainErrorLog.push({
+          at: Date.now(),
+          source: 'main',
+          message: 'Langfuse tracing is enabled but no exporter is available; Deep Research completed without a remote trace.',
+          stack: null,
+        });
+      }
+      return;
+    }
+    try {
+      const finishedAt = result.summary.finishedAt ?? Date.now();
+      const ref = await this.langfuseBackend.exportResearchRun({
+        folioRunId: result.summary.id,
+        startedAt: result.summary.startedAt,
+        completedAt: finishedAt,
+        symbol: result.summary.symbol,
+        strategyId: result.report?.strategyId,
+        query: `Deep research ${result.summary.symbol}`,
+        capabilities: result.report?.capabilityRuns.map((run) => ({
+          capabilityId: run.capabilityId,
+          status: run.status,
+          startedAt: run.fetchedAt,
+          finishedAt: run.fetchedAt,
+          error: run.error,
+        })) ?? result.summary.plannedCapabilities.map((id) => ({
+          capabilityId: id,
+          status: result.summary.completedCapabilities.includes(id) ? 'success' : 'unavailable',
+        })),
+        report: result.report,
+        model: this.evaluationSettings.langfuseTracingEnabled ? 'folio-synthesizer' : undefined,
+        metadata: {
+          folioRunId: result.summary.id,
+          runKind: 'normal',
+          folioVersion: currentFolioVersion(),
+          symbol: result.summary.symbol,
+          strategyId: result.report?.strategyId,
+        },
+      });
+      const scores = scoresFromResearchReport(result.report, undefined, Math.max(0, finishedAt - result.summary.startedAt));
+      if (ref.traceId && scores.length > 0) {
+        await this.langfuseBackend.submitScores(ref.traceId, scores);
+      }
+      if (ref.traceId) await this.persistTraceLink(result.summary.id, ref);
+    } catch (error) {
+      mainErrorLog.push({
+        at: Date.now(),
+        source: 'main',
+        message: `Langfuse Deep Research export failed: ${error instanceof Error ? error.message : String(error)}`,
         stack: null,
       });
     }
@@ -1426,6 +1667,15 @@ export class AgentKernelHost {
     return { ai, marketData, skills, agentRuntime };
   }
 
+  private async hydrateInstrumentCatalog(userData: string): Promise<void> {
+    try {
+      const store = new InstrumentCatalogStore(new JsonFileStore(userData));
+      this.instrumentResolver = await store.load();
+    } catch {
+      // Keep the in-memory seed catalog if persistence is unavailable.
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Provider connections (spec §8–11)
   // -------------------------------------------------------------------------
@@ -1445,6 +1695,7 @@ export class AgentKernelHost {
     const coverage =
       this.providerRouter.coverage().find((c) => c.providerId === provider.id) ?? null;
     const config = await this.connectionStore.getConfig(provider.id);
+    const routing = await this.connectionStore.getRouting(DEFAULT_PROVIDER_ROUTING);
     let hasAccount = false;
     let accountLabel: string | null = null;
     if (provider.kind === 'broker-account') {
@@ -1462,14 +1713,27 @@ export class AgentKernelHost {
       providerId: provider.id,
       kind: provider.kind,
       name: provider.name,
-      status: health?.status ?? state?.status ?? 'not-connected',
+      status: state?.status ?? health?.status ?? 'not-connected',
       health,
       coverage,
       configurable: provider.id === 'massive',
-      configured: Boolean(config?.apiKey),
+      configured:
+        provider.id === 'massive'
+          ? Boolean(await this.credentials.getCredential(MASSIVE_CREDENTIAL_ID))
+          : health?.status === 'connected',
       hasAccount,
       accountLabel,
       error: state?.error ?? null,
+      enabled: config?.enabled !== false,
+      endpoint: config?.endpoint ?? null,
+      region: config?.region ?? health?.region ?? null,
+      routingRole:
+        routing.primary === provider.id
+          ? 'primary'
+          : routing.fallback === provider.id
+            ? 'fallback'
+            : null,
+      recentResult: this.providerRouter.lastResultFor(provider.id) ?? null,
     };
   }
 
@@ -1560,6 +1824,8 @@ export class AgentKernelHost {
     if (!provider) return null;
     if (providerId === 'longbridge') {
       await longbridgeLogout({ exec: executeLongBridgeCli });
+    } else if (providerId === 'massive') {
+      await this.credentials.removeCredential(MASSIVE_CREDENTIAL_ID);
     }
     await this.connectionStore.update({ providerId, status: 'not-connected', lastCheck: Date.now() });
     return this.entryFor(provider);
@@ -1569,34 +1835,137 @@ export class AgentKernelHost {
     const request = requireObject(input);
     const providerId = requireString(request.providerId, 'providerId');
     if (providerId === 'longbridge') {
-      return longbridgeTestConnection({ exec: executeLongBridgeCli });
+      const health = await longbridgeTestConnection({ exec: executeLongBridgeCli });
+      const diagnostic: ProviderHealth['diagnostic'] =
+        health.status === 'connected'
+          ? 'healthy'
+          : health.status === 'permission-limited'
+            ? 'partial-failure'
+            : health.status === 'not-connected'
+              ? 'missing-credential'
+              : 'unhealthy';
+      const result = { ...health, diagnostic };
+      await this.persistProviderHealth(providerId, result);
+      return result;
     }
     const provider = this.providerRouter.get(providerId);
     if (!provider) throw createCodeError('UNKNOWN_PROVIDER', 'Unknown provider.');
-    return (await this.providerHealth(provider)) ?? {
-      status: 'error',
-      lastCheck: Date.now(),
-      message: 'Provider did not answer a health probe.',
-    };
+    const startedAt = Date.now();
+    if (provider.kind !== 'financial-data') {
+      throw createCodeError('CONFIG_UNSUPPORTED', 'This provider uses the Longbridge connection test.');
+    }
+    const probe = await provider.execute(
+      'market.quote',
+      { symbol: 'AAPL.US' },
+      AbortSignal.timeout(10_000)
+    );
+    const health: ProviderHealth = probe.ok
+      ? {
+          status: 'connected',
+          diagnostic: 'healthy',
+          lastCheck: Date.now(),
+          latencyMs: Date.now() - startedAt,
+          message: 'Production data request succeeded.',
+        }
+      : this.healthFromProviderError(probe.error, startedAt);
+    await this.persistProviderHealth(providerId, health);
+    return health;
   }
 
   async setProviderConfig(input: unknown): Promise<ConnectionEntry> {
     const request = requireObject(input);
     const providerId = requireString(request.providerId, 'providerId');
     const config = requireObject(request.config);
-    if (providerId !== 'massive') {
-      throw createCodeError('CONFIG_UNSUPPORTED', 'Only API-key providers accept config.');
+    const provider = this.providerRouter.get(providerId);
+    if (!provider) throw createCodeError('UNKNOWN_PROVIDER', 'Unknown provider.');
+    const existing = await this.connectionStore.getConfig(providerId);
+    const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : undefined;
+    if (apiKey !== undefined) {
+      if (providerId !== 'massive') {
+        throw createCodeError('CONFIG_UNSUPPORTED', 'This provider does not accept API keys.');
+      }
+      if (!apiKey) throw createCodeError('INVALID_ARGUMENT', 'An API key is required.');
+      await this.credentials.setCredential(MASSIVE_CREDENTIAL_ID, apiKey);
     }
-    const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
-    if (!apiKey) {
-      throw createCodeError('INVALID_ARGUMENT', 'An API key is required.');
+    const enabled = typeof config.enabled === 'boolean' ? config.enabled : existing?.enabled;
+    const endpoint =
+      typeof config.endpoint === 'string'
+        ? config.endpoint.trim() || undefined
+        : existing?.endpoint;
+    const region =
+      typeof config.region === 'string' ? config.region.trim() || undefined : existing?.region;
+    if (endpoint && !endpoint.startsWith('https://')) {
+      throw createCodeError('INVALID_ARGUMENT', 'Provider endpoint must use HTTPS.');
     }
-    await this.connectionStore.setConfig(providerId, { apiKey });
+    await this.connectionStore.setConfig(providerId, { enabled, endpoint, region });
+    const routingRole = config.routingRole;
+    if (routingRole === 'primary' || routingRole === 'fallback') {
+      const current = await this.connectionStore.getRouting(DEFAULT_PROVIDER_ROUTING);
+      const next =
+        routingRole === 'primary'
+          ? {
+              primary: providerId,
+              fallback: current.primary === providerId ? current.fallback : current.primary,
+            }
+          : {
+              primary:
+                current.primary === providerId ? (current.fallback ?? providerId) : current.primary,
+              fallback: providerId,
+            };
+      await this.connectionStore.setRouting(next);
+      this.providerRouter.setRouting(next);
+    }
+    await this.connectionStore.update({ providerId, status: 'not-connected', lastCheck: Date.now() });
     const massive = this.providerRouter.get('massive');
     if (massive instanceof MassiveFinancialDataProvider) {
       massive.clearCache();
     }
-    return this.entryFor(this.providerRouter.get(providerId)!);
+    return this.entryFor(provider);
+  }
+
+  private healthFromProviderError(error: { code: string; message: string }, startedAt: number): ProviderHealth {
+    const diagnostic =
+      error.code === 'CONFIG_MISSING'
+        ? 'missing-credential'
+        : error.code === 'AUTH_EXPIRED'
+          ? 'authentication-failed'
+          : error.code === 'RATE_LIMITED'
+            ? 'rate-limited'
+            : error.code === 'ACCESS_DENIED'
+              ? 'partial-failure'
+              : error.code === 'TIMEOUT' || error.code === 'UNKNOWN'
+                ? 'unreachable'
+                : 'unhealthy';
+    return {
+      status:
+        error.code === 'AUTH_EXPIRED'
+          ? 'expired'
+          : error.code === 'ACCESS_DENIED'
+            ? 'permission-limited'
+            : 'error',
+      diagnostic,
+      diagnosticCode: error.code,
+      lastCheck: Date.now(),
+      latencyMs: Date.now() - startedAt,
+      message: redactSecrets(error.message),
+    };
+  }
+
+  private async persistProviderHealth(providerId: string, health: ProviderHealth): Promise<void> {
+    await this.connectionStore.update({
+      providerId,
+      status: health.status,
+      lastCheck: health.lastCheck,
+      connectedAt: health.status === 'connected' ? health.lastCheck : undefined,
+      error:
+        health.diagnosticCode && health.status !== 'connected'
+          ? {
+              code: health.diagnosticCode,
+              message: redactSecrets(health.message ?? 'Provider check failed.'),
+            }
+          : undefined,
+    });
+    void this.pushConnections();
   }
 
   async coverageMatrix(): Promise<ProviderCoverage[]> {
