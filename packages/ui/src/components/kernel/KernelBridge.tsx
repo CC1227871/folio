@@ -3,6 +3,7 @@ import { useAtom, useSetAtom } from 'jotai';
 import type { FinagentClient } from '../../client';
 import {
   activeSessionIdAtom,
+  loadBranchesAtom,
   hydrateSessionsAtom,
   loadMessagesAtom,
   loadedSessionIdsAtom,
@@ -19,6 +20,7 @@ import { applyAgentEventAtom } from '../../atoms/runAtoms';
 export const KernelBridge: React.FC<{ client: FinagentClient }> = ({ client }) => {
   const hydrate = useSetAtom(hydrateSessionsAtom);
   const loadMessages = useSetAtom(loadMessagesAtom);
+  const loadBranches = useSetAtom(loadBranchesAtom);
   const applyEvent = useSetAtom(applyAgentEventAtom);
   const [activeSessionId] = useAtom(activeSessionIdAtom);
   const [loadedSessionIds] = useAtom(loadedSessionIdsAtom);
@@ -32,10 +34,12 @@ export const KernelBridge: React.FC<{ client: FinagentClient }> = ({ client }) =
   }, [client, hydrate, applyEvent]);
 
   useEffect(() => {
-    if (activeSessionId && !loadedSessionIds.has(activeSessionId)) {
+    if (!activeSessionId) return;
+    void loadBranches(client, activeSessionId);
+    if (!loadedSessionIds.has(activeSessionId)) {
       void loadMessages(client, activeSessionId);
     }
-  }, [client, activeSessionId, loadedSessionIds, loadMessages]);
+  }, [client, activeSessionId, loadedSessionIds, loadBranches, loadMessages]);
 
   return null;
 };

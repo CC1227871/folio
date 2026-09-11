@@ -85,6 +85,10 @@ export const agent = {
   chat: {
     noMessages: '还没有消息，开始对话吧！',
   },
+  branch: {
+    current: '分支',
+    switch: '切换对话分支',
+  },
   suggestions: {
     title: '试试问',
     research: [

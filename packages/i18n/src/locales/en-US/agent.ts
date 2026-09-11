@@ -85,6 +85,10 @@ export const agent = {
   chat: {
     noMessages: 'No messages yet. Start the conversation!',
   },
+  branch: {
+    current: 'Branch',
+    switch: 'Switch conversation branch',
+  },
   suggestions: {
     title: 'Try asking',
     research: [

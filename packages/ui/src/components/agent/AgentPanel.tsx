@@ -22,6 +22,7 @@ import { MessageList } from '../chat/MessageList';
 import { MarkdownContent } from '../chat/MarkdownContent';
 import { ModelSelector } from './ModelSelector';
 import { ThinkingSelector } from './ThinkingSelector';
+import { BranchSwitcher } from './BranchSwitcher';
 import { ToolActivity } from './ToolActivity';
 import { ContextChip } from './ContextChip';
 import { TraceInspector } from '../trace/TraceInspector';
@@ -251,6 +252,7 @@ export const AgentPanel: React.FC = () => {
       <div className="folio-agent-context border-b mac-section-divider px-3 py-2">
         <ContextChip />
       </div>
+      <BranchSwitcher disabled={isRunning} />
 
       {/* Scrollable body: tool activity, structured results, messages, live answer */}
       <div className="folio-agent-body flex-1 overflow-y-auto scrollbar-hover">
