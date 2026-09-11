@@ -142,6 +142,58 @@ describe('PiRpcClient', () => {
     expect(state).toMatchObject({ sessionId: 'pi-123', sessionFile: '/tmp/s1.jsonl' });
   });
 
+  it('exposes Pi native fork cursors and append-only entry identities', async () => {
+    const client = new PiRpcClient({
+      spawnProcess: createSpawn(() =>
+        new FakePiProcess((line, proc) => {
+          if (line.type === 'fork') {
+            proc.writeEvent({
+              id: line.id,
+              type: 'response',
+              command: 'fork',
+              success: true,
+              data: { text: 'Original prompt', cancelled: false },
+            });
+          }
+          if (line.type === 'get_fork_messages') {
+            proc.writeEvent({
+              id: line.id,
+              type: 'response',
+              command: 'get_fork_messages',
+              success: true,
+              data: { messages: [{ entryId: 'u-1', text: 'Original prompt' }] },
+            });
+          }
+          if (line.type === 'get_entries') {
+            proc.writeEvent({
+              id: line.id,
+              type: 'response',
+              command: 'get_entries',
+              success: true,
+              data: {
+                entries: [
+                  { type: 'message', id: 'u-1', parentId: null, message: { role: 'user', content: 'Original prompt' } },
+                  { type: 'message', id: 'a-1', parentId: 'u-1', message: { role: 'assistant', content: 'Original answer' } },
+                ],
+                leafId: 'a-1',
+              },
+            });
+          }
+        })
+      ),
+    });
+
+    await expect(client.fork('u-1')).resolves.toEqual({ text: 'Original prompt', cancelled: false });
+    await expect(client.getForkMessages()).resolves.toEqual([{ entryId: 'u-1', text: 'Original prompt' }]);
+    await expect(client.getEntries()).resolves.toMatchObject({
+      leafId: 'a-1',
+      entries: [
+        { id: 'u-1', parentId: null, message: { role: 'user' } },
+        { id: 'a-1', parentId: 'u-1', message: { role: 'assistant' } },
+      ],
+    });
+  });
+
   it('streams raw Pi events and settles with the aggregated result', async () => {
     const client = new PiRpcClient({
       spawnProcess: createSpawn(() =>
