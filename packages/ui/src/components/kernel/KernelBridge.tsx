@@ -6,6 +6,7 @@ import {
   loadBranchesAtom,
   hydrateSessionsAtom,
   loadMessagesAtom,
+  loadRunsAtom,
   loadedSessionIdsAtom,
 } from '../../atoms/sessionAtoms';
 import { applyAgentEventAtom } from '../../atoms/runAtoms';
@@ -21,6 +22,7 @@ export const KernelBridge: React.FC<{ client: FinagentClient }> = ({ client }) =
   const hydrate = useSetAtom(hydrateSessionsAtom);
   const loadMessages = useSetAtom(loadMessagesAtom);
   const loadBranches = useSetAtom(loadBranchesAtom);
+  const loadRuns = useSetAtom(loadRunsAtom);
   const applyEvent = useSetAtom(applyAgentEventAtom);
   const [activeSessionId] = useAtom(activeSessionIdAtom);
   const [loadedSessionIds] = useAtom(loadedSessionIdsAtom);
@@ -36,10 +38,11 @@ export const KernelBridge: React.FC<{ client: FinagentClient }> = ({ client }) =
   useEffect(() => {
     if (!activeSessionId) return;
     void loadBranches(client, activeSessionId);
+    void loadRuns(client, activeSessionId);
     if (!loadedSessionIds.has(activeSessionId)) {
       void loadMessages(client, activeSessionId);
     }
-  }, [client, activeSessionId, loadedSessionIds, loadBranches, loadMessages]);
+  }, [client, activeSessionId, loadedSessionIds, loadBranches, loadMessages, loadRuns]);
 
   return null;
 };

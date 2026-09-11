@@ -1,6 +1,6 @@
 import { atom } from 'jotai';
 import { atomFamily } from 'jotai/utils';
-import type { ApiResult, ConversationBranch, Message, SessionMeta } from '@finagent/core';
+import type { ApiResult, ConversationBranch, Message, Run, SessionMeta } from '@finagent/core';
 import type { FinagentClient } from '../client';
 
 // The kernel (main process) is the source of truth for sessions and messages;
@@ -22,10 +22,16 @@ export const messagesAtomFamily = atomFamily((_sessionId: string) => atom<Messag
 // Branch metadata is cached per session so switching sessions does not lose
 // the last selected branch or make the renderer reconstruct lineage locally.
 export const branchesAtomFamily = atomFamily((_sessionId: string) => atom<ConversationBranch[]>([]));
+export const runsAtomFamily = atomFamily((_sessionId: string) => atom<Run[]>([]));
 
 export const activeBranchesAtom = atom((get) => {
   const activeId = get(activeSessionIdAtom);
   return activeId ? get(branchesAtomFamily(activeId)) : [];
+});
+
+export const activeRunsAtom = atom((get) => {
+  const activeId = get(activeSessionIdAtom);
+  return activeId ? get(runsAtomFamily(activeId)) : [];
 });
 
 export const activeBranchAtom = atom((get) => {
@@ -96,20 +102,28 @@ export const loadBranchesAtom = atom(
   }
 );
 
-/** Switch the persisted branch and immediately reload its visible projection. */
-export const switchBranchAtom = atom(
+export const loadRunsAtom = atom(
+  null,
+  async (_get, set, client: FinagentClient, sessionId: string) => {
+    const result = await client.kernel.listRuns(sessionId);
+    if (result.ok) set(runsAtomFamily(sessionId), result.data);
+    return result;
+  }
+);
+
+/** Refresh the local projection after an operation has already activated a branch in the kernel. */
+export const refreshBranchProjectionAtom = atom(
   null,
   async (_get, set, client: FinagentClient, sessionId: string, branchId: string): Promise<ApiResult<ConversationBranch>> => {
-    const result = await client.kernel.setActiveBranch(sessionId, branchId);
-    if (!result.ok) return result;
+    const branches = await client.kernel.listBranches(sessionId);
+    if (!branches.ok) return branches;
+    const branch = branches.data.find((candidate) => candidate.id === branchId);
+    if (!branch) return { ok: false, error: { code: 'BRANCH_NOT_FOUND', message: `Branch ${branchId} was not found.` } };
 
+    set(branchesAtomFamily(sessionId), branches.data);
     set(sessionsAtom, (sessions) => sessions.map((session) =>
       session.id === sessionId ? { ...session, activeBranchId: branchId } : session
     ));
-    set(branchesAtomFamily(sessionId), (branches) => branches.map((branch) =>
-      branch.id === branchId ? result.data : branch
-    ));
-
     const messages = await client.kernel.getMessages(sessionId);
     if (messages.ok) {
       set(messagesAtomFamily(sessionId), messages.data);
@@ -119,7 +133,17 @@ export const switchBranchAtom = atom(
         return next;
       });
     }
-    return result;
+    return { ok: true, data: branch };
+  }
+);
+
+/** Switch the persisted branch and immediately reload its visible projection. */
+export const switchBranchAtom = atom(
+  null,
+  async (_get, set, client: FinagentClient, sessionId: string, branchId: string): Promise<ApiResult<ConversationBranch>> => {
+    const result = await client.kernel.setActiveBranch(sessionId, branchId);
+    if (!result.ok) return result;
+    return set(refreshBranchProjectionAtom, client, sessionId, result.data.id);
   }
 );
 

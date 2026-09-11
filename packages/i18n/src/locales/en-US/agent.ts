@@ -89,6 +89,14 @@ export const agent = {
     current: 'Branch',
     switch: 'Switch conversation branch',
   },
+  actions: {
+    edit: 'Edit',
+    regenerate: 'Regenerate',
+    retry: 'Retry',
+    fork: 'Fork',
+    save: 'Save and run',
+    cancel: 'Cancel',
+  },
   suggestions: {
     title: 'Try asking',
     research: [

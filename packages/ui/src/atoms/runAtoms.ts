@@ -2,7 +2,7 @@ import { atom } from 'jotai';
 import type { AgentEvent, ApiError, Message, Run, ToolCall, WorkspaceContext } from '@finagent/core';
 import { isRuntimeInfraCode } from '@finagent/core';
 import type { FinagentClient } from '../client';
-import { activeSessionIdAtom, messagesAtomFamily, sessionsAtom } from './sessionAtoms';
+import { activeSessionIdAtom, messagesAtomFamily, runsAtomFamily, sessionsAtom } from './sessionAtoms';
 
 /** Live view of the currently executing run, streamed from kernel events. */
 export interface RunView {
@@ -61,9 +61,13 @@ export const applyAgentEventAtom = atom(
 
     if (event.type === 'run_started') {
       // Kernel persists the user message; surface it in the UI here.
-      if (event.payload.userMessageIsNew !== false) {
+      if (event.payload.userMessageIsNew !== false && !get(messages).some((message) => message.id === event.payload.userMessage.id)) {
         set(messages, [...get(messages), event.payload.userMessage]);
       }
+      set(runsAtomFamily(sessionId), (runs) => [
+        event.payload.run,
+        ...runs.filter((candidate) => candidate.id !== event.payload.run.id),
+      ]);
       set(sessionsAtom, (sessions) => sessions.map((session) =>
         session.id === sessionId
           ? {
@@ -157,6 +161,11 @@ export const applyAgentEventAtom = atom(
         })),
       };
       set(messages, [...get(messages), assistantMessage]);
+      set(runsAtomFamily(sessionId), (runs) => runs.map((candidate) =>
+        candidate.id === event.runId
+          ? { ...candidate, status: 'completed' as const, completedAt: event.timestamp, answer: event.payload.answer, error: undefined }
+          : candidate
+      ));
       set(sessionsAtom, (sessions) => sessions.map((session) =>
         session.id === sessionId ? { ...session, status: 'idle' as const, messageCount: session.messageCount + 1 } : session
       ));
@@ -184,6 +193,17 @@ export const applyAgentEventAtom = atom(
       // renders a dedicated runtime banner with Retry + Diagnostics. Real
       // failures (tool errors, task failures) keep the existing message flow.
       const error = event.payload.error;
+      set(runsAtomFamily(sessionId), (runs) => runs.map((candidate) =>
+        candidate.id === event.runId
+          ? {
+              ...candidate,
+              status: cancelled ? 'cancelled' as const : 'failed' as const,
+              completedAt: event.timestamp,
+              error,
+              answer: run.answer,
+            }
+          : candidate
+      ));
       if (isRuntimeInfraCode(error.code)) {
         set(lastRunSummaryAtom, (previous) => ({
           runId: event.runId,

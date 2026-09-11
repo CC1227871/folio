@@ -89,6 +89,14 @@ export const agent = {
     current: '分支',
     switch: '切换对话分支',
   },
+  actions: {
+    edit: '编辑',
+    regenerate: '重新生成',
+    retry: '重试',
+    fork: '创建分支',
+    save: '保存并运行',
+    cancel: '取消',
+  },
   suggestions: {
     title: '试试问',
     research: [
