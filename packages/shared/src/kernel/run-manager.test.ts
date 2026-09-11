@@ -11,6 +11,7 @@ import type {
   RuntimeSession,
   ToolDefinition,
 } from '@finagent/core';
+import { BranchRepository } from '../storage/branch-repository.ts';
 import { JsonFileStore } from '../storage/json-file-store.ts';
 import { MessageRepository } from '../storage/message-repository.ts';
 import { RunRepository } from '../storage/run-repository.ts';
@@ -37,6 +38,7 @@ function makeKernel(script: (input: AgentRunInput) => AsyncIterable<AgentEvent>)
     sessions: new SessionRepository(store),
     messages: new MessageRepository(store),
     runs: new RunRepository(store),
+    branches: new BranchRepository(store),
     piSessionDir: join(dir, 'pi-sessions'),
     now: () => clock,
   });
