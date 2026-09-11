@@ -282,6 +282,110 @@ describe('RunManager', () => {
       code: 'SESSION_NOT_FOUND',
     });
   });
+
+  it('regenerates without duplicating the inherited user message or overwriting the old answer', async () => {
+    const { sessions, runs } = makeKernel((input) => completedScript(`answer-${input.runId}`)(input));
+    const session = await sessions.createSession('A');
+
+    await runs.startRun(session.id, 'compare NVDA');
+    await waitFor(async () => !runs.isRunning());
+    const originalMessages = await sessions.listMessages(session.id);
+    const originalAnswer = originalMessages[1];
+    const regenerated = await runs.regenerateMessage(session.id, originalAnswer.id);
+    await waitFor(async () => !runs.isRunning());
+
+    const branches = await sessions.listBranches(session.id);
+    expect(branches).toHaveLength(2);
+    expect(regenerated.operation).toBe('regenerate');
+    expect(regenerated.parentRunId).toBeTruthy();
+    expect(regenerated.manifest).toMatchObject({ operation: 'regenerate', toolCallIds: ['t1'] });
+    expect((await sessions.listMessages(session.id)).map((message) => message.id)).toEqual([
+      originalMessages[0].id,
+      `assistant-${regenerated.id}`,
+    ]);
+    expect((await sessions.listAllMessages(session.id)).map((message) => message.id)).toEqual([
+      originalMessages[0].id,
+      originalAnswer.id,
+      `assistant-${regenerated.id}`,
+    ]);
+  });
+
+  it('edits from the selected historical point and excludes later answers from the new branch', async () => {
+    const { sessions, runs } = makeKernel(completedScript('answer'));
+    const session = await sessions.createSession('A');
+
+    await runs.startRun(session.id, 'first question');
+    await waitFor(async () => !runs.isRunning());
+    await runs.startRun(session.id, 'second question');
+    await waitFor(async () => !runs.isRunning());
+    const original = await sessions.listMessages(session.id);
+    const editedRun = await runs.editMessage(session.id, original[2].id, 'edited second question');
+    await waitFor(async () => !runs.isRunning());
+
+    expect(editedRun.operation).toBe('edit');
+    expect(editedRun.sourceMessageId).toBe(original[2].id);
+    expect((await sessions.listMessages(session.id)).map((message) => message.content)).toEqual([
+      'first question',
+      'answer',
+      'edited second question',
+      'answer',
+    ]);
+    expect((await sessions.listMessages(session.id)).some((message) => message.content === 'second question')).toBe(false);
+  });
+
+  it('retries only failed runs and creates a new generation on a child branch', async () => {
+    let attempts = 0;
+    const { sessions, runs } = makeKernel(async function* (input) {
+      attempts += 1;
+      if (attempts === 1) {
+        yield event(input.sessionId, input.runId, 'run_failed', {
+          error: { code: 'TOOL_EXECUTION_ERROR', message: 'temporary failure' },
+        });
+        return;
+      }
+      yield* completedScript('retried answer')(input);
+    });
+    const session = await sessions.createSession('A');
+
+    const failed = await runs.startRun(session.id, 'retry me');
+    await waitFor(async () => !runs.isRunning());
+    const retried = await runs.retryRun(session.id, failed.id);
+    await waitFor(async () => !runs.isRunning());
+
+    expect(retried.operation).toBe('retry');
+    expect(retried.parentRunId).toBe(failed.id);
+    expect(retried.id).not.toBe(failed.id);
+    expect((await sessions.listMessages(session.id)).map((message) => message.content)).toEqual([
+      'retry me',
+      'retried answer',
+    ]);
+    await expect(runs.retryRun(session.id, retried.id)).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+  });
+
+  it('forks from an earlier message and keeps the fork cursor after reload', async () => {
+    const { sessions, runs } = makeKernel(completedScript('answer'));
+    const session = await sessions.createSession('A');
+    await runs.startRun(session.id, 'first');
+    await waitFor(async () => !runs.isRunning());
+    await runs.startRun(session.id, 'second');
+    await waitFor(async () => !runs.isRunning());
+    const original = await sessions.listMessages(session.id);
+
+    const branch = await runs.forkBranch(session.id, original[1].id, 'Research alternative');
+    expect(branch.parentBranchId).toBeTruthy();
+    expect((await sessions.listMessages(session.id)).map((message) => message.content)).toEqual(['first', 'answer']);
+
+    await runs.startRun(session.id, 'alternative question');
+    await waitFor(async () => !runs.isRunning());
+    const reloaded = new SessionRepository(new JsonFileStore(dir));
+    expect((await reloaded.get(session.id))?.activeBranchId).toBe(branch.id);
+    expect((await sessions.listMessages(session.id)).map((message) => message.content)).toEqual([
+      'first',
+      'answer',
+      'alternative question',
+      'answer',
+    ]);
+  });
 });
 
 async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 2000) {

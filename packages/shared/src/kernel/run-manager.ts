@@ -4,8 +4,11 @@ import type {
   AgentEventPayload,
   AgentRuntime,
   ApiError,
+  ConversationBranch,
+  ConversationOperation,
   Message,
   Run,
+  RunContextSnapshot,
   SessionMeta,
   ToolCall,
   ToolCallRecord,
@@ -27,6 +30,19 @@ interface ActiveRun {
   sessionId: string;
   runId: string;
   cancelRequested: boolean;
+}
+
+interface GenerationOptions {
+  session: SessionMeta;
+  branch: ConversationBranch;
+  content: string;
+  operation: ConversationOperation;
+  sourceMessageId?: string;
+  parentRunId?: string;
+  parentMessageId?: string;
+  existingUserMessage?: Message;
+  workspaceContext?: WorkspaceContext;
+  locale?: SupportedLocale;
 }
 
 /**
@@ -74,54 +90,172 @@ export class RunManager {
     workspaceContext?: WorkspaceContext,
     locale?: SupportedLocale
   ): Promise<Run> {
-    const text = content.trim();
-    if (!text) {
-      throw createCodeError('INVALID_ARGUMENT', 'Message content is required.');
-    }
-    if (this.activeRun) {
-      throw createCodeError(
-        'RUN_IN_PROGRESS',
-        'Another run is still in progress. Stop it before sending a new message.'
-      );
-    }
-
     const session = await this.sessions.getSession(sessionId);
     if (!session) {
       throw createCodeError('SESSION_NOT_FOUND', `Session ${sessionId} was not found.`);
     }
-
-    const now = this.now();
-    const run: Run = {
-      id: randomUUID(),
-      sessionId,
-      status: 'running',
-      input: text,
-      startedAt: now,
-    };
-    await this.runs.create(run);
-
-    const userMessage: Message = {
-      id: randomUUID(),
-      role: 'user',
-      content: text,
-      timestamp: now,
-    };
-    await this.sessions.appendMessage(sessionId, userMessage);
-    await this.sessions.updateSession(sessionId, { status: 'running' });
-
-    this.activeRun = { sessionId, runId: run.id, cancelRequested: false };
-    this.emit({
-      id: randomUUID(),
-      sessionId,
-      runId: run.id,
-      type: 'run_started',
-      timestamp: now,
-      sequence: 1,
-      payload: { run, userMessage },
+    const branch = await this.sessions.getActiveBranch(sessionId);
+    if (!branch) {
+      throw createCodeError('BRANCH_NOT_FOUND', `The active branch for session ${sessionId} was not found.`);
+    }
+    const visibleMessages = await this.sessions.listMessages(sessionId, branch.id);
+    return this.startGeneration({
+      session,
+      branch,
+      content,
+      operation: 'send',
+      parentMessageId: visibleMessages.at(-1)?.id,
+      workspaceContext,
+      locale,
     });
+  }
 
-    void this.execute(run, session, workspaceContext, locale);
-    return run;
+  /** Retry a failed/cancelled generation on a new child branch. */
+  async retryRun(
+    sessionId: string,
+    runId: string,
+    workspaceContext?: WorkspaceContext,
+    locale?: SupportedLocale
+  ): Promise<Run> {
+    this.assertNoActiveRun();
+    const sourceRun = await this.sessions.getRun(sessionId, runId);
+    if (!sourceRun) throw createCodeError('RUN_NOT_FOUND', `Run ${runId} was not found.`);
+    if (sourceRun.status !== 'failed' && sourceRun.status !== 'cancelled') {
+      throw createCodeError('INVALID_ARGUMENT', 'Only failed or cancelled runs can be retried.');
+    }
+
+    const sourceBranch = await this.branchForRun(sessionId, sourceRun);
+    const visible = await this.sessions.listMessages(sessionId, sourceBranch.id);
+    const userIndex = findUserMessageIndex(visible, sourceRun);
+    const sourceUser = userIndex >= 0 ? visible[userIndex] : undefined;
+    const child = await this.createDerivedBranch(
+      sessionId,
+      sourceBranch,
+      userIndex > 0 ? visible[userIndex - 1].id : null,
+      `Retry · ${sourceRun.input.slice(0, 32)}`
+    );
+    const session = await this.requireSession(sessionId);
+    return this.startGeneration({
+      session,
+      branch: child,
+      content: sourceRun.input,
+      operation: 'retry',
+      sourceMessageId: sourceUser?.id,
+      parentRunId: sourceRun.id,
+      parentMessageId: userIndex > 0 ? visible[userIndex - 1].id : undefined,
+      workspaceContext,
+      locale,
+    });
+  }
+
+  /** Regenerate an assistant artifact while inheriting the same user context. */
+  async regenerateMessage(
+    sessionId: string,
+    assistantMessageId: string,
+    workspaceContext?: WorkspaceContext,
+    locale?: SupportedLocale
+  ): Promise<Run> {
+    this.assertNoActiveRun();
+    const sourceBranch = await this.sessions.getActiveBranch(sessionId);
+    if (!sourceBranch) throw createCodeError('BRANCH_NOT_FOUND', 'The active branch was not found.');
+    const visible = await this.sessions.listMessages(sessionId, sourceBranch.id);
+    const assistant = visible.find((message) => message.id === assistantMessageId);
+    if (!assistant || assistant.role !== 'assistant') {
+      throw createCodeError('MESSAGE_NOT_FOUND', `Assistant message ${assistantMessageId} was not found.`);
+    }
+    const sourceRun = assistant.runId ? await this.sessions.getRun(sessionId, assistant.runId) : null;
+    if (!sourceRun) {
+      throw createCodeError('RUN_NOT_FOUND', `The generation for message ${assistantMessageId} was not found.`);
+    }
+    const userMessage = sourceRun.userMessageId
+      ? visible.find((message) => message.id === sourceRun.userMessageId)
+      : findPreviousUserMessage(visible, visible.indexOf(assistant));
+    if (!userMessage) {
+      throw createCodeError('MESSAGE_NOT_FOUND', 'The user context for this answer was not found.');
+    }
+    const child = await this.createDerivedBranch(
+      sessionId,
+      sourceBranch,
+      userMessage.id,
+      `Regenerate · ${userMessage.content.slice(0, 28)}`
+    );
+    const session = await this.requireSession(sessionId);
+    return this.startGeneration({
+      session,
+      branch: child,
+      content: userMessage.content,
+      operation: 'regenerate',
+      sourceMessageId: assistant.id,
+      parentRunId: sourceRun.id,
+      parentMessageId: userMessage.id,
+      existingUserMessage: userMessage,
+      workspaceContext,
+      locale,
+    });
+  }
+
+  /** Edit a historical user message and rerun from the preceding cursor. */
+  async editMessage(
+    sessionId: string,
+    userMessageId: string,
+    content: string,
+    workspaceContext?: WorkspaceContext,
+    locale?: SupportedLocale
+  ): Promise<Run> {
+    this.assertNoActiveRun();
+    const text = content.trim();
+    if (!text) throw createCodeError('INVALID_ARGUMENT', 'Message content is required.');
+    const sourceBranch = await this.sessions.getActiveBranch(sessionId);
+    if (!sourceBranch) throw createCodeError('BRANCH_NOT_FOUND', 'The active branch was not found.');
+    const visible = await this.sessions.listMessages(sessionId, sourceBranch.id);
+    const sourceIndex = visible.findIndex((message) => message.id === userMessageId);
+    const sourceMessage = sourceIndex >= 0 ? visible[sourceIndex] : undefined;
+    if (!sourceMessage || sourceMessage.role !== 'user') {
+      throw createCodeError('MESSAGE_NOT_FOUND', `User message ${userMessageId} was not found.`);
+    }
+    const child = await this.createDerivedBranch(
+      sessionId,
+      sourceBranch,
+      sourceIndex > 0 ? visible[sourceIndex - 1].id : null,
+      `Edit · ${text.slice(0, 32)}`
+    );
+    const session = await this.requireSession(sessionId);
+    return this.startGeneration({
+      session,
+      branch: child,
+      content: text,
+      operation: 'edit',
+      sourceMessageId: sourceMessage.id,
+      parentMessageId: sourceIndex > 0 ? visible[sourceIndex - 1].id : undefined,
+      workspaceContext,
+      locale,
+    });
+  }
+
+  /** Create and activate a branch from an earlier visible message. */
+  async forkBranch(sessionId: string, messageId: string, name?: string): Promise<ConversationBranch> {
+    this.assertNoActiveRun();
+    const sourceBranch = await this.sessions.getActiveBranch(sessionId);
+    if (!sourceBranch) throw createCodeError('BRANCH_NOT_FOUND', 'The active branch was not found.');
+    const visible = await this.sessions.listMessages(sessionId, sourceBranch.id);
+    if (!visible.some((message) => message.id === messageId)) {
+      throw createCodeError('MESSAGE_NOT_FOUND', `Message ${messageId} was not found.`);
+    }
+    const child = await this.createDerivedBranch(
+      sessionId,
+      sourceBranch,
+      messageId,
+      name?.trim() || `Fork · ${new Date(this.now()).toISOString()}`
+    );
+    await this.sessions.setActiveBranch(sessionId, child.id);
+    return child;
+  }
+
+  async setActiveBranch(sessionId: string, branchId: string): Promise<ConversationBranch> {
+    this.assertNoActiveRun();
+    const branch = await this.sessions.setActiveBranch(sessionId, branchId);
+    if (!branch) throw createCodeError('BRANCH_NOT_FOUND', `Branch ${branchId} was not found.`);
+    return branch;
   }
 
   /** Abort the given run if it is the one currently executing. */
@@ -132,6 +266,125 @@ export class RunManager {
     }
     active.cancelRequested = true;
     await this.runtime.cancel({ sessionId, runId });
+  }
+
+  private async startGeneration(options: GenerationOptions): Promise<Run> {
+    const text = options.content.trim();
+    if (!text) throw createCodeError('INVALID_ARGUMENT', 'Message content is required.');
+    if (this.activeRun) {
+      throw createCodeError(
+        'RUN_IN_PROGRESS',
+        'Another run is still in progress. Stop it before sending a new message.'
+      );
+    }
+
+    const now = this.now();
+    const runId = randomUUID();
+    const contextSnapshot: RunContextSnapshot = {
+      capturedAt: now,
+      workspaceContext: options.workspaceContext,
+      recentSymbols: options.session.recentSymbols ? [...options.session.recentSymbols] : undefined,
+    };
+    const userMessage = options.existingUserMessage ?? {
+      id: randomUUID(),
+      role: 'user' as const,
+      content: text,
+      timestamp: now,
+      branchId: options.branch.id,
+      parentMessageId: options.parentMessageId,
+      runId,
+      generationId: runId,
+      operation: options.operation,
+      sourceMessageId: options.sourceMessageId,
+      contextSnapshot,
+    };
+    const run: Run = {
+      id: runId,
+      sessionId: options.session.id,
+      status: 'running',
+      input: text,
+      startedAt: now,
+      branchId: options.branch.id,
+      operation: options.operation,
+      parentRunId: options.parentRunId,
+      sourceMessageId: options.sourceMessageId,
+      userMessageId: userMessage.id,
+      generationId: runId,
+      contextSnapshot,
+      manifest: {
+        runId,
+        branchId: options.branch.id,
+        operation: options.operation,
+        inputMessageId: userMessage.id,
+        parentRunId: options.parentRunId,
+        sourceMessageId: options.sourceMessageId,
+        contextSnapshot,
+        toolCallIds: [],
+      },
+    };
+
+    await this.runs.create(run);
+    if (!options.existingUserMessage) {
+      await this.sessions.appendMessage(options.session.id, userMessage);
+    }
+    await this.sessions.updateSession(options.session.id, { status: 'running' });
+
+    this.activeRun = { sessionId: options.session.id, runId: run.id, cancelRequested: false };
+    this.emit({
+      id: randomUUID(),
+      sessionId: options.session.id,
+      runId: run.id,
+      type: 'run_started',
+      timestamp: now,
+      sequence: 1,
+      payload: {
+        run,
+        userMessage,
+        userMessageIsNew: !options.existingUserMessage,
+      },
+    });
+
+    void this.execute(run, options.session, options.workspaceContext, options.locale);
+    return run;
+  }
+
+  private assertNoActiveRun(): void {
+    if (this.activeRun) {
+      throw createCodeError(
+        'RUN_IN_PROGRESS',
+        'Another run is still in progress. Stop it before changing conversation branches.'
+      );
+    }
+  }
+
+  private async requireSession(sessionId: string): Promise<SessionMeta> {
+    const session = await this.sessions.getSession(sessionId);
+    if (!session) throw createCodeError('SESSION_NOT_FOUND', `Session ${sessionId} was not found.`);
+    return session;
+  }
+
+  private async branchForRun(sessionId: string, run: Run): Promise<ConversationBranch> {
+    const branch = run.branchId
+      ? await this.sessions.getBranch(sessionId, run.branchId)
+      : await this.sessions.getActiveBranch(sessionId);
+    if (!branch) throw createCodeError('BRANCH_NOT_FOUND', 'The source branch was not found.');
+    return branch;
+  }
+
+  private async createDerivedBranch(
+    sessionId: string,
+    parent: ConversationBranch,
+    forkMessageId: string | null | undefined,
+    name: string
+  ): Promise<ConversationBranch> {
+    const child = await this.sessions.createBranch({
+      sessionId,
+      name,
+      parentBranchId: parent.id,
+      forkMessageId,
+    });
+    await this.sessions.setActiveBranch(sessionId, child.id);
+    return child;
   }
 
   private async execute(
@@ -195,6 +448,12 @@ export class RunManager {
       run.answer = answer;
     }
     run.completedAt = now;
+    if (run.manifest) {
+      run.manifest = {
+        ...run.manifest,
+        toolCallIds: toolCalls.map((toolCall) => toolCall.id),
+      };
+    }
 
     await this.runs.update(run);
 
@@ -205,11 +464,20 @@ export class RunManager {
     const isInfraFailure = run.status === 'failed' && isRuntimeInfraCode(run.error?.code);
     if (!isInfraFailure) {
       const assistantMessage: Message = {
-        id: randomUUID(),
+        // The run id gives the assistant artifact a deterministic stable id
+        // across the live event projection and a subsequent reload.
+        id: `assistant-${run.id}`,
         role: 'assistant',
         content: answer || (run.status === 'failed' ? run.error?.message ?? 'Run failed.' : ''),
         timestamp: now,
         toolCalls: toolCalls.map(toRecord),
+        branchId: run.branchId,
+        parentMessageId: run.userMessageId,
+        runId: run.id,
+        generationId: run.generationId ?? run.id,
+        operation: run.operation,
+        sourceMessageId: run.sourceMessageId,
+        contextSnapshot: run.contextSnapshot,
       };
       await this.sessions.appendMessage(run.sessionId, assistantMessage);
     }
@@ -280,4 +548,22 @@ function collectSymbols(toolCalls: ToolCall[]): string[] {
     }
   }
   return symbols.slice(0, 5);
+}
+
+function findUserMessageIndex(messages: Message[], run: Run): number {
+  if (run.userMessageId) {
+    const exact = messages.findIndex((message) => message.id === run.userMessageId);
+    if (exact >= 0) return exact;
+  }
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === 'user' && messages[index].content === run.input) return index;
+  }
+  return -1;
+}
+
+function findPreviousUserMessage(messages: Message[], beforeIndex: number): Message | undefined {
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    if (messages[index].role === 'user') return messages[index];
+  }
+  return undefined;
 }

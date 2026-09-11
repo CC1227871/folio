@@ -1,5 +1,5 @@
 import { atom } from 'jotai';
-import type { AgentEvent, ApiError, Message, ToolCall, WorkspaceContext } from '@finagent/core';
+import type { AgentEvent, ApiError, Message, Run, ToolCall, WorkspaceContext } from '@finagent/core';
 import { isRuntimeInfraCode } from '@finagent/core';
 import type { FinagentClient } from '../client';
 import { activeSessionIdAtom, messagesAtomFamily, sessionsAtom } from './sessionAtoms';
@@ -8,6 +8,11 @@ import { activeSessionIdAtom, messagesAtomFamily, sessionsAtom } from './session
 export interface RunView {
   runId: string;
   sessionId: string;
+  branchId?: string;
+  operation?: Run['operation'];
+  generationId?: string;
+  userMessageId?: string;
+  contextSnapshot?: Run['contextSnapshot'];
   answer: string;
   toolCalls: ToolCall[];
   error?: ApiError;
@@ -56,13 +61,26 @@ export const applyAgentEventAtom = atom(
 
     if (event.type === 'run_started') {
       // Kernel persists the user message; surface it in the UI here.
-      set(messages, [...get(messages), event.payload.userMessage]);
+      if (event.payload.userMessageIsNew !== false) {
+        set(messages, [...get(messages), event.payload.userMessage]);
+      }
       set(sessionsAtom, (sessions) => sessions.map((session) =>
-        session.id === sessionId ? { ...session, status: 'running' as const, messageCount: session.messageCount + 1 } : session
+        session.id === sessionId
+          ? {
+              ...session,
+              status: 'running' as const,
+              messageCount: session.messageCount + (event.payload.userMessageIsNew === false ? 0 : 1),
+            }
+          : session
       ));
       set(runViewAtom, {
         runId: event.runId,
         sessionId,
+        branchId: event.payload.run.branchId,
+        operation: event.payload.run.operation,
+        generationId: event.payload.run.generationId,
+        userMessageId: event.payload.run.userMessageId,
+        contextSnapshot: event.payload.run.contextSnapshot,
         answer: '',
         toolCalls: [],
         infraError: undefined,
@@ -121,6 +139,12 @@ export const applyAgentEventAtom = atom(
         role: 'assistant',
         content: event.payload.answer,
         timestamp: event.timestamp,
+        branchId: run.branchId,
+        parentMessageId: run.userMessageId,
+        runId: event.runId,
+        generationId: run.generationId ?? event.runId,
+        operation: run.operation,
+        contextSnapshot: run.contextSnapshot,
         toolCalls: event.payload.toolCalls.map((toolCall) => ({
           id: toolCall.id,
           toolName: toolCall.toolName,
@@ -181,6 +205,12 @@ export const applyAgentEventAtom = atom(
           ? (run.answer || '(run stopped)')
           : `Error: ${error.message}`,
         timestamp: event.timestamp,
+        branchId: run.branchId,
+        parentMessageId: run.userMessageId,
+        runId: event.runId,
+        generationId: run.generationId ?? event.runId,
+        operation: run.operation,
+        contextSnapshot: run.contextSnapshot,
         toolCalls: run.toolCalls.map((toolCall) => ({
           id: toolCall.id,
           toolName: toolCall.toolName,

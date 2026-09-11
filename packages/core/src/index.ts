@@ -150,8 +150,10 @@ export interface RunContextSnapshot {
 /**
  * A logical conversation branch.  `forkMessageId` is the last message from
  * the parent branch visible in this branch; messages after it are local to the
- * new branch.  This makes branch materialization deterministic and preserves
- * the original branch unchanged.
+ * new branch. `null` explicitly means "start before the first parent
+ * message", while `undefined` is reserved for legacy metadata. This makes
+ * branch materialization deterministic and preserves the original branch
+ * unchanged.
  */
 export interface ConversationBranch {
   id: string;
@@ -160,7 +162,7 @@ export interface ConversationBranch {
   createdAt: number;
   updatedAt: number;
   parentBranchId?: string;
-  forkMessageId?: string;
+  forkMessageId?: string | null;
   /** Pi's tree leaf for this branch, when the Pi runtime is in use. */
   runtimeLeafId?: string;
 }
@@ -266,6 +268,8 @@ export type AgentEvent =
 export interface RunStartedPayload {
   run: Run;
   userMessage: Message;
+  /** False when a new generation reuses an inherited user message. */
+  userMessageIsNew?: boolean;
 }
 
 /**

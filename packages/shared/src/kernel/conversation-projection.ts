@@ -29,7 +29,9 @@ export function materializeBranchMessages(
     let inherited: Message[] = [];
     if (branch.parentBranchId) {
       inherited = visit(branch.parentBranchId, nextStack);
-      if (branch.forkMessageId) {
+      if (branch.forkMessageId === null) {
+        inherited = [];
+      } else if (branch.forkMessageId !== undefined) {
         const forkIndex = inherited.findIndex((message) => message.id === branch.forkMessageId);
         inherited = forkIndex >= 0 ? inherited.slice(0, forkIndex + 1) : [];
       }

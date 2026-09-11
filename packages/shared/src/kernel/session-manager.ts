@@ -169,7 +169,7 @@ export class SessionManager {
     sessionId: string;
     name?: string;
     parentBranchId?: string;
-    forkMessageId?: string;
+    forkMessageId?: string | null;
     runtimeLeafId?: string;
   }): Promise<ConversationBranch> {
     const session = await this.sessions.get(input.sessionId);
@@ -183,7 +183,7 @@ export class SessionManager {
       createdAt: now,
       updatedAt: now,
       parentBranchId: input.parentBranchId,
-      forkMessageId: input.forkMessageId,
+      forkMessageId: input.parentBranchId ? input.forkMessageId ?? null : undefined,
       runtimeLeafId: input.runtimeLeafId,
     };
     if (branch.parentBranchId && !(await this.branches.get(input.sessionId, branch.parentBranchId))) {
