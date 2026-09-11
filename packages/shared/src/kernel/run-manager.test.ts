@@ -8,6 +8,9 @@ import type {
   AgentRunInput,
   AgentRuntime,
   ApiResult,
+  RuntimeBranchPreparationInput,
+  RuntimeBranchState,
+  RuntimeRunArtifacts,
   RuntimeSession,
   ToolDefinition,
 } from '@finagent/core';
@@ -31,8 +34,11 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-function makeKernel(script: (input: AgentRunInput) => AsyncIterable<AgentEvent>) {
-  const runtime = new ScriptedRuntime(script);
+function makeKernel(
+  script: (input: AgentRunInput) => AsyncIterable<AgentEvent>,
+  nativeBranch = false
+) {
+  const runtime = new ScriptedRuntime(script, nativeBranch);
   const store = new JsonFileStore(dir);
   const sessions = new SessionManager({
     sessions: new SessionRepository(store),
@@ -52,18 +58,48 @@ function makeKernel(script: (input: AgentRunInput) => AsyncIterable<AgentEvent>)
 }
 
 class ScriptedRuntime implements AgentRuntime {
-  ensureSessionCalls: Array<{ id: string; sessionPath?: string }> = [];
+  ensureSessionCalls: Array<{ id: string; branchId?: string; sessionPath?: string }> = [];
+  prepareBranchCalls: RuntimeBranchPreparationInput[] = [];
   cancelCalls: Array<{ sessionId: string; runId: string }> = [];
 
-  constructor(private readonly script: (input: AgentRunInput) => AsyncIterable<AgentEvent>) {}
+  constructor(
+    private readonly script: (input: AgentRunInput) => AsyncIterable<AgentEvent>,
+    private readonly nativeBranch: boolean
+  ) {}
 
   async getTools(): Promise<ApiResult<ToolDefinition[]>> {
     return { ok: true, data: [] };
   }
 
-  async ensureSession(session: { id: string; title?: string; sessionPath?: string }): Promise<RuntimeSession> {
+  async ensureSession(session: {
+    id: string;
+    title?: string;
+    branchId?: string;
+    sessionPath?: string;
+  }): Promise<RuntimeSession> {
     this.ensureSessionCalls.push(session);
     return { sessionId: session.id, status: 'active' };
+  }
+
+  async prepareBranch(input: RuntimeBranchPreparationInput): Promise<RuntimeBranchState> {
+    if (!this.nativeBranch) return {};
+    this.prepareBranchCalls.push(input);
+    return {
+      runtimeSessionPath: `/runtime/${input.branchId}.jsonl`,
+      runtimeSessionId: `pi-${input.branchId}`,
+      runtimeLeafId: `leaf-${input.branchId}`,
+    };
+  }
+
+  async getRunArtifacts(input: { sessionId: string; runId: string }): Promise<RuntimeRunArtifacts | undefined> {
+    if (!this.nativeBranch) return undefined;
+    return {
+      runtimeSessionId: `pi-${input.sessionId}`,
+      runtimeSessionPath: `/runtime/${input.runId}.jsonl`,
+      runtimeLeafId: `leaf-${input.runId}`,
+      runtimeUserEntryId: `user-${input.runId}`,
+      runtimeAssistantEntryId: `assistant-${input.runId}`,
+    };
   }
 
   async *run(input: AgentRunInput): AsyncIterable<AgentEvent> {

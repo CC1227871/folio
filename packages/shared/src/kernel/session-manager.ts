@@ -164,6 +164,25 @@ export class SessionManager {
     return branch;
   }
 
+  /** Persist runtime identity discovered after a native branch operation. */
+  async updateBranch(
+    sessionId: string,
+    branchId: string,
+    patch: Partial<ConversationBranch>
+  ): Promise<ConversationBranch | null> {
+    const branch = await this.branches.get(sessionId, branchId);
+    if (!branch) return null;
+    const updated: ConversationBranch = {
+      ...branch,
+      ...patch,
+      id: branch.id,
+      sessionId: branch.sessionId,
+      updatedAt: this.now(),
+    };
+    await this.branches.update(updated);
+    return updated;
+  }
+
   /** Create an immutable child branch from the selected parent cursor. */
   async createBranch(input: {
     sessionId: string;
@@ -171,6 +190,8 @@ export class SessionManager {
     parentBranchId?: string;
     forkMessageId?: string | null;
     runtimeLeafId?: string;
+    runtimeSessionPath?: string;
+    runtimeForkEntryId?: string;
   }): Promise<ConversationBranch> {
     const session = await this.sessions.get(input.sessionId);
     if (!session) throw new Error(`Session ${input.sessionId} was not found.`);
@@ -185,6 +206,8 @@ export class SessionManager {
       parentBranchId: input.parentBranchId,
       forkMessageId: input.parentBranchId ? input.forkMessageId ?? null : undefined,
       runtimeLeafId: input.runtimeLeafId,
+      runtimeSessionPath: input.runtimeSessionPath,
+      runtimeForkEntryId: input.runtimeForkEntryId,
     };
     if (branch.parentBranchId && !(await this.branches.get(input.sessionId, branch.parentBranchId))) {
       throw new Error(`Parent branch ${branch.parentBranchId} was not found.`);

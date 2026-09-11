@@ -9,6 +9,7 @@ import type {
   Message,
   Run,
   RunContextSnapshot,
+  RuntimeRunArtifacts,
   SessionMeta,
   ToolCall,
   ToolCallRecord,
@@ -128,11 +129,14 @@ export class RunManager {
     const visible = await this.sessions.listMessages(sessionId, sourceBranch.id);
     const userIndex = findUserMessageIndex(visible, sourceRun);
     const sourceUser = userIndex >= 0 ? visible[userIndex] : undefined;
+    const runtimeForkEntryId = sourceRun.runtimeUserEntryId ??
+      (sourceUser ? await this.runtimeForkEntryForMessage(sessionId, sourceUser) : undefined);
     const child = await this.createDerivedBranch(
       sessionId,
       sourceBranch,
       userIndex > 0 ? visible[userIndex - 1].id : null,
-      `Retry · ${sourceRun.input.slice(0, 32)}`
+      `Retry · ${sourceRun.input.slice(0, 32)}`,
+      runtimeForkEntryId
     );
     const session = await this.requireSession(sessionId);
     return this.startGeneration({
@@ -173,11 +177,14 @@ export class RunManager {
     if (!userMessage) {
       throw createCodeError('MESSAGE_NOT_FOUND', 'The user context for this answer was not found.');
     }
+    const runtimeForkEntryId = sourceRun.runtimeUserEntryId ??
+      await this.runtimeForkEntryForMessage(sessionId, userMessage);
     const child = await this.createDerivedBranch(
       sessionId,
       sourceBranch,
       userMessage.id,
-      `Regenerate · ${userMessage.content.slice(0, 28)}`
+      `Regenerate · ${userMessage.content.slice(0, 28)}`,
+      runtimeForkEntryId
     );
     const session = await this.requireSession(sessionId);
     return this.startGeneration({
@@ -213,11 +220,13 @@ export class RunManager {
     if (!sourceMessage || sourceMessage.role !== 'user') {
       throw createCodeError('MESSAGE_NOT_FOUND', `User message ${userMessageId} was not found.`);
     }
+    const runtimeForkEntryId = await this.runtimeForkEntryForMessage(sessionId, sourceMessage);
     const child = await this.createDerivedBranch(
       sessionId,
       sourceBranch,
       sourceIndex > 0 ? visible[sourceIndex - 1].id : null,
-      `Edit · ${text.slice(0, 32)}`
+      `Edit · ${text.slice(0, 32)}`,
+      runtimeForkEntryId
     );
     const session = await this.requireSession(sessionId);
     return this.startGeneration({
@@ -241,11 +250,16 @@ export class RunManager {
     if (!visible.some((message) => message.id === messageId)) {
       throw createCodeError('MESSAGE_NOT_FOUND', `Message ${messageId} was not found.`);
     }
+    const sourceMessage = visible.find((message) => message.id === messageId);
+    const runtimeForkEntryId = sourceMessage
+      ? await this.runtimeForkEntryForMessage(sessionId, sourceMessage)
+      : undefined;
     const child = await this.createDerivedBranch(
       sessionId,
       sourceBranch,
       messageId,
-      name?.trim() || `Fork · ${new Date(this.now()).toISOString()}`
+      name?.trim() || `Fork · ${new Date(this.now()).toISOString()}`,
+      runtimeForkEntryId
     );
     await this.sessions.setActiveBranch(sessionId, child.id);
     return child;
@@ -371,17 +385,33 @@ export class RunManager {
     return branch;
   }
 
+  /** Resolve the native Pi user-entry cursor for a Folio message. */
+  private async runtimeForkEntryForMessage(sessionId: string, message: Message): Promise<string | undefined> {
+    const run = message.runId ? await this.sessions.getRun(sessionId, message.runId) : null;
+    if (message.role === 'user') {
+      return run?.runtimeUserEntryId ?? message.runtimeEntryId;
+    }
+    // Pi forks before a user entry. When the UI forks from an assistant
+    // artifact, use the user generation that produced that artifact.
+    if (message.role === 'assistant') {
+      return run?.runtimeUserEntryId;
+    }
+    return message.runtimeEntryId;
+  }
+
   private async createDerivedBranch(
     sessionId: string,
     parent: ConversationBranch,
     forkMessageId: string | null | undefined,
-    name: string
+    name: string,
+    runtimeForkEntryId?: string
   ): Promise<ConversationBranch> {
     const child = await this.sessions.createBranch({
       sessionId,
       name,
       parentBranchId: parent.id,
       forkMessageId,
+      runtimeForkEntryId,
     });
     await this.sessions.setActiveBranch(sessionId, child.id);
     return child;
@@ -399,10 +429,33 @@ export class RunManager {
     let sawTerminal = false;
 
     try {
+      let branch = run.branchId
+        ? await this.sessions.getBranch(run.sessionId, run.branchId)
+        : null;
+      let runtimeSessionPath = branch?.runtimeSessionPath ?? session.runtimeSessionPath;
+
+      if (branch?.parentBranchId && !branch.runtimeSessionPath && this.runtime.prepareBranch) {
+        const parent = await this.sessions.getBranch(run.sessionId, branch.parentBranchId);
+        const prepared = await this.runtime.prepareBranch({
+          sessionId: run.sessionId,
+          branchId: branch.id,
+          parentBranchId: branch.parentBranchId,
+          parentSessionPath: parent?.runtimeSessionPath ?? session.runtimeSessionPath,
+          forkMessageId: branch.forkMessageId,
+          forkRuntimeEntryId: branch.runtimeForkEntryId,
+        });
+        branch = await this.sessions.updateBranch(run.sessionId, branch.id, {
+          runtimeLeafId: prepared.runtimeLeafId,
+          runtimeSessionPath: prepared.runtimeSessionPath,
+        });
+        runtimeSessionPath = prepared.runtimeSessionPath ?? runtimeSessionPath;
+      }
+
       await this.runtime.ensureSession({
         id: run.sessionId,
         title: session.title,
-        sessionPath: session.runtimeSessionPath,
+        branchId: run.branchId,
+        sessionPath: runtimeSessionPath,
         recentSymbols: session.recentSymbols,
       });
 
@@ -410,6 +463,8 @@ export class RunManager {
         sessionId: run.sessionId,
         runId: run.id,
         content: run.input,
+        branchId: run.branchId,
+        sessionPath: runtimeSessionPath,
         workspaceContext,
         locale,
       })) {
@@ -436,6 +491,16 @@ export class RunManager {
     const now = this.now();
     const cancelled = Boolean(cancelRequested || (failure && failure.code === 'RUN_CANCELLED'));
 
+    let runtimeArtifacts: RuntimeRunArtifacts | undefined;
+    if (this.runtime.getRunArtifacts) {
+      try {
+        runtimeArtifacts = await this.runtime.getRunArtifacts({ sessionId: run.sessionId, runId: run.id });
+      } catch {
+        // Runtime diagnostics must never turn an already-settled generation
+        // into a second failure.
+      }
+    }
+
     if (cancelled) {
       run.status = 'cancelled';
       run.answer = answer;
@@ -448,10 +513,28 @@ export class RunManager {
       run.answer = answer;
     }
     run.completedAt = now;
+    if (runtimeArtifacts) {
+      run.runtimeSessionId = runtimeArtifacts.runtimeSessionId;
+      run.runtimeSessionPath = runtimeArtifacts.runtimeSessionPath;
+      run.runtimeLeafId = runtimeArtifacts.runtimeLeafId;
+      run.runtimeUserEntryId = runtimeArtifacts.runtimeUserEntryId;
+      run.runtimeAssistantEntryId = runtimeArtifacts.runtimeAssistantEntryId;
+      if (run.branchId) {
+        await this.sessions.updateBranch(run.sessionId, run.branchId, {
+          runtimeLeafId: runtimeArtifacts.runtimeLeafId,
+          runtimeSessionPath: runtimeArtifacts.runtimeSessionPath,
+        });
+      }
+    }
     if (run.manifest) {
       run.manifest = {
         ...run.manifest,
         toolCallIds: toolCalls.map((toolCall) => toolCall.id),
+        runtimeSessionId: run.runtimeSessionId,
+        runtimeSessionPath: run.runtimeSessionPath,
+        runtimeLeafId: run.runtimeLeafId,
+        runtimeUserEntryId: run.runtimeUserEntryId,
+        runtimeAssistantEntryId: run.runtimeAssistantEntryId,
       };
     }
 
@@ -478,6 +561,7 @@ export class RunManager {
         operation: run.operation,
         sourceMessageId: run.sourceMessageId,
         contextSnapshot: run.contextSnapshot,
+        runtimeEntryId: run.runtimeAssistantEntryId,
       };
       await this.sessions.appendMessage(run.sessionId, assistantMessage);
     }
