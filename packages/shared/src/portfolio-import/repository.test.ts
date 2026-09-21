@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ManualPortfolio } from '@finagent/core'
 import { JsonFileStore } from '../storage/json-file-store.ts'
-import { createDraft, draftToPortfolioInput, validateDraft } from './draft.ts'
+import { createDraft, draftHasRecognizableSymbols, draftToPortfolioInput, validateDraft } from './draft.ts'
 import { parseCsv, parsePaste } from './parsers.ts'
 import { ManualPortfolioRepository } from './repository.ts'
 
@@ -21,6 +21,14 @@ const INPUT = {
 }
 
 describe('ManualPortfolioRepository', () => {
+  it('persists TSV quantities and costs without splitting thousands separators', async () => {
+    const store = tempStore()
+    const draft = createDraft('csv', parseCsv('Symbol\tQuantity\tCost\tCurrency\nAAPL.US\t1,000\t1,234.50\tUSD'))
+    const created = await new ManualPortfolioRepository(store).create(draftToPortfolioInput(draft, 'TSV'))
+    const reloaded = await new ManualPortfolioRepository(store).get(created.id)
+    expect(reloaded?.holdings).toEqual([{ symbol: 'AAPL.US', name: '', quantity: 1000, costPrice: 1234.5, currency: 'USD' }])
+  })
+
   it('keeps invalid numeric cells absent through draft review and persistence', async () => {
     const store = tempStore()
     const draft = createDraft('csv', parseCsv('Symbol,Quantity,Cost\nAAPL.US,100,$\nMSFT.US,",",180.5'))
@@ -113,6 +121,30 @@ describe('ManualPortfolioRepository', () => {
     expect(created.id).toBeTruthy()
   })
 
+  for (const [description, contents] of [
+    ['a null root', 'null'],
+    ['an empty object', '{}'],
+    ['a missing portfolios field', '{"other":[]}'],
+    ['a null portfolios field', '{"portfolios":null}'],
+    ['a non-array portfolios field', '{"portfolios":{}}'],
+  ] as const) {
+    it(`treats ${description} as empty and allows a new portfolio to be created`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'folio-manual-portfolios-'))
+      writeFileSync(join(dir, 'manual-portfolios.json'), contents)
+      const repository = new ManualPortfolioRepository(new JsonFileStore(dir))
+
+      expect(await repository.list()).toEqual([])
+
+      const created = await repository.create(INPUT)
+
+      expect(await repository.list()).toEqual([created])
+      const stored = JSON.parse(readFileSync(join(dir, 'manual-portfolios.json'), 'utf8')) as {
+        portfolios: ManualPortfolio[]
+      }
+      expect(stored.portfolios).toEqual([created])
+    })
+  }
+
   it('omits currency in the file when the input has none', async () => {
     const store = tempStore()
     const repository = new ManualPortfolioRepository(store)
@@ -125,6 +157,26 @@ describe('ManualPortfolioRepository', () => {
 })
 
 describe('confirm persists only after confirm (spec §93)', () => {
+  it('preserves empty paste columns through review and persisted holdings', async () => {
+    const store = tempStore()
+    const repository = new ManualPortfolioRepository(store)
+    const draft = createDraft('paste', parsePaste('AAPL.US,100,\nMSFT.US,,180.5,USD'))
+    expect(draft.warnings).toContain('2 rows need review')
+    expect(await repository.list()).toEqual([])
+    const created = await repository.create(draftToPortfolioInput(draft, 'Partial holdings'))
+    const reloaded = await new ManualPortfolioRepository(store).get(created.id)
+    expect(reloaded?.holdings).toEqual([
+      { symbol: 'AAPL.US', name: '', quantity: 100 },
+      { symbol: 'MSFT.US', name: '', costPrice: 180.5, currency: 'USD' },
+    ])
+  })
+
+  it('keeps a missing leading symbol blocked at draft confirmation', () => {
+    const draft = createDraft('paste', parsePaste(',100,180.5,USD'))
+    expect(draftHasRecognizableSymbols(draft)).toBe(false)
+    expect(draft.warnings).toContain('1 row with no recognizable symbol')
+  })
+
   it('draft creation has zero side effects on disk', async () => {
     const store = tempStore()
     const repository = new ManualPortfolioRepository(store)

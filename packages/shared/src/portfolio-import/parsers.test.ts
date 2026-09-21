@@ -108,6 +108,30 @@ describe('splitCsvLine', () => {
 })
 
 describe('parseCsv', () => {
+  it('keeps thousands separators inside tab-delimited numeric cells', () => {
+    const [row] = parseCsv('Symbol\tQuantity\tCost\tCurrency\nAAPL.US\t1,000\t1,234.50\tUSD')
+    expect(row).toMatchObject({ symbol: 'AAPL.US', quantity: 1000, costPrice: 1234.5, currency: 'USD', confidence: 1, issues: [] })
+  })
+
+  it('uses the header delimiter even when data contains commas and quoted newlines', () => {
+    const [row] = parseCsv('Symbol\tName\tQuantity\tCost\nAAPL.US\t"Apple,\nInc."\t100\t180.5')
+    expect(row).toMatchObject({ name: 'Apple,\nInc.', quantity: 100, costPrice: 180.5, issues: [] })
+    const [plain] = parseCsv('Symbol\tName\tQuantity\tCost\nAAPL.US\tApple, Inc.\t100\t180.5')
+    expect(plain).toMatchObject({ name: 'Apple, Inc.', quantity: 100, costPrice: 180.5, issues: [] })
+  })
+
+  it('does not split embedded tabs in comma-delimited fields', () => {
+    const [row] = parseCsv('Symbol,Name,Quantity,Cost\nAAPL.US,Apple\tInc.,100,180.5')
+    expect(row).toMatchObject({ name: 'Apple\tInc.', quantity: 100, costPrice: 180.5, issues: [] })
+  })
+
+  it('supports headerless TSV and explicit TSV header mappings', () => {
+    const [row] = parseCsv('AAPL.US\tApple, Inc.\t1,000\t180.5')
+    expect(row).toMatchObject({ name: 'Apple, Inc.', quantity: 1000, costPrice: 180.5, issues: [] })
+    const [mapped] = parseCsv('Ticker\tUnits\tAvg Cost\nAAPL.US\t1,000\t180.5', { symbol: 'Ticker', quantity: 'Units', cost: 'Avg Cost' })
+    expect(mapped).toMatchObject({ symbol: 'AAPL.US', quantity: 1000, costPrice: 180.5, issues: [] })
+  })
+
   it('flags formatting-only quantities and costs without inventing zeros', () => {
     const rows = parseCsv('Symbol,Quantity,Cost\nAAPL.US,100,$\nMSFT.US,",",180.5\n0700.HK,500,320')
     expect(rows).toHaveLength(3)
@@ -214,6 +238,59 @@ describe('confidence tiers (spec §48)', () => {
 })
 
 describe('parsePaste (spec §46)', () => {
+  it('keeps quantity in place when the trailing cost column is empty', () => {
+    const [row] = parsePaste('AAPL.US,100,')
+    expect(row.quantity).toBe(100)
+    expect(row.costPrice).toBeUndefined()
+    expect(row.issues).toEqual(['Cost price missing'])
+    expect(row.confidence).toBe(0.6)
+  })
+
+  it('keeps cost and currency in place when quantity is empty', () => {
+    const [row] = parsePaste('AAPL.US, ,180.5,USD')
+    expect(row.quantity).toBeUndefined()
+    expect(row.costPrice).toBe(180.5)
+    expect(row.currency).toBe('USD')
+    expect(row.issues).toEqual(['Quantity missing'])
+    expect(row.confidence).toBe(0.6)
+  })
+
+  it('keeps currency in place when cost is empty', () => {
+    const [row] = parsePaste('AAPL.US,100, ,USD')
+    expect(row.quantity).toBe(100)
+    expect(row.costPrice).toBeUndefined()
+    expect(row.currency).toBe('USD')
+    expect(row.issues).toEqual(['Cost price missing'])
+  })
+
+  it('does not turn an empty symbol into a quantity ticker', () => {
+    const [row] = parsePaste(',100,180.5,USD')
+    expect(row.symbol).toBe('')
+    expect(row.quantity).toBe(100)
+    expect(row.costPrice).toBe(180.5)
+    expect(row.currency).toBe('USD')
+    expect(row.issues).toEqual(['Missing symbol'])
+  })
+
+  it('keeps both numeric fields missing when both columns are empty', () => {
+    const [row] = parsePaste('AAPL.US, , ,USD')
+    expect(row.quantity).toBeUndefined()
+    expect(row.costPrice).toBeUndefined()
+    expect(row.currency).toBe('USD')
+    expect(row.issues).toEqual(['Quantity missing', 'Cost price missing'])
+  })
+
+  it('preserves the existing two-column symbol-cost shorthand', () => {
+    const [row] = parsePaste('AAPL.US,180.5')
+    expect(row.quantity).toBeUndefined()
+    expect(row.costPrice).toBe(180.5)
+    expect(row.issues).toEqual(['Quantity missing'])
+    const [empty] = parsePaste('AAPL.US, ')
+    expect(empty.quantity).toBeUndefined()
+    expect(empty.costPrice).toBeUndefined()
+    expect(empty.issues).toEqual(['Quantity missing', 'Cost price missing'])
+  })
+
   it('flags formatting-only numeric cells in both paste formats', () => {
     for (const input of ['AAPL.US $ $', 'AAPL.US, $, $']) {
       const [row] = parsePaste(input)

@@ -130,8 +130,18 @@ export function splitCsvRows(text: string): string[] {
   return rows
 }
 
-/** Split one CSV row into cells (comma or tab separated, quote-aware). */
-export function splitCsvLine(line: string): string[] {
+/** Use the first unquoted separator; quoted punctuation belongs to a cell. */
+function csvDelimiter(line: string): ',' | '\t' {
+  let inQuotes = false
+  for (const ch of line) {
+    if (ch === '"') inQuotes = !inQuotes
+    else if (!inQuotes && (ch === ',' || ch === '\t')) return ch
+  }
+  return ','
+}
+
+/** Split one CSV row using one delimiter, honoring quoted cells. */
+export function splitCsvLine(line: string, delimiter: ',' | '\t' = csvDelimiter(line)): string[] {
   const cells: string[] = []
   let current = ''
   let inQuotes = false
@@ -150,7 +160,7 @@ export function splitCsvLine(line: string): string[] {
       }
     } else if (ch === '"') {
       inQuotes = true
-    } else if (ch === ',' || ch === '\t') {
+    } else if (ch === delimiter) {
       cells.push(current)
       current = ''
     } else {
@@ -180,9 +190,10 @@ export interface CsvColumnMap {
  */
 export function resolveCsvColumns(
   firstRow: string,
-  headerMapping?: CsvHeaderMapping
+  headerMapping?: CsvHeaderMapping,
+  delimiter: ',' | '\t' = csvDelimiter(firstRow)
 ): CsvColumnMap {
-  const cells = splitCsvLine(firstRow).map(normalizeHeaderCell)
+  const cells = splitCsvLine(firstRow, delimiter).map(normalizeHeaderCell)
   const byIndex = new Map<number, HeaderField>()
   const fields = Object.keys(HEADER_ALIASES) as HeaderField[]
 
@@ -314,13 +325,16 @@ export function flagDuplicates(rows: PortfolioImportRow[]): PortfolioImportRow[]
  */
 export function parseCsv(text: string, headerMapping?: CsvHeaderMapping): PortfolioImportRow[] {
   const rawRows = splitCsvRows(text)
-  if (rawRows.length === 0) return []
-  const columns = resolveCsvColumns(rawRows[0], headerMapping)
-  const start = columns.isHeader ? 1 : 0
+  // Empty logical records must not hide the real header or influence delimiter detection.
+  const firstRow = rawRows.findIndex((row) => splitCsvLine(row).some((cell) => cell.trim() !== ''))
+  if (firstRow < 0) return []
+  const delimiter = csvDelimiter(rawRows[firstRow])
+  const columns = resolveCsvColumns(rawRows[firstRow], headerMapping, delimiter)
+  const start = firstRow + (columns.isHeader ? 1 : 0)
 
   const rows: PortfolioImportRow[] = []
   for (let i = start; i < rawRows.length; i++) {
-    const cells = splitCsvLine(rawRows[i])
+    const cells = splitCsvLine(rawRows[i], delimiter)
     if (cells.every((cell) => cell.trim() === '')) continue
     rows.push(buildRow(fieldsFromCells(cells, columns.byIndex)))
   }
@@ -349,12 +363,12 @@ export function parsePasteLine(line: string): PortfolioImportRow {
   const parts = trimmed.includes(',')
     ? trimmed
         .split(',')
-        .map((part) => part.trim())
-        .filter((part) => part !== '')
+        // Empty cells still occupy a column; dropping them shifts holdings data.
+        .map((part) => part.trim() || undefined)
     : trimmed.split(/\s+/)
 
   const fields: ParsedFields = { symbol: '', name: undefined, quantity: undefined, cost: undefined, currency: undefined, account: undefined }
-  if (parts.length >= 1) fields.symbol = parts[0]
+  if (parts.length >= 1) fields.symbol = parts[0] ?? ''
   if (parts.length >= 3) {
     fields.quantity = parts[1]
     fields.cost = parts[2]

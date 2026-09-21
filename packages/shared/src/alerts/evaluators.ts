@@ -311,7 +311,12 @@ async function evaluatePositionWeight(
   const held =
     enriched !== undefined || (rawPositions?.some((p) => sameSymbol(p.symbol, rule.symbol)) ?? false);
   if (!held) return null;
-  const holdingValue = enriched ? (enriched.marketValueBase ?? enriched.marketValue) : undefined;
+  // Raw marketValue is denominated in the holding currency. Only compare it
+  // with totalAssets when both currencies are known to match.
+  const holdingCurrency = enriched?.currency?.trim().toUpperCase();
+  const baseCurrency = summary.baseCurrency?.trim().toUpperCase();
+  const sameCurrency = Boolean(holdingCurrency && baseCurrency && holdingCurrency === baseCurrency);
+  const holdingValue = enriched?.marketValueBase ?? (sameCurrency ? enriched?.marketValue : undefined);
   if (typeof holdingValue !== 'number') return null; // held, value unknown
 
   const weight = holdingValue / summary.totalAssets;
@@ -333,11 +338,13 @@ async function evaluateDrawdown(
   ctx: AlertEvaluatorContext
 ): Promise<AlertTriggerEvent | null> {
   const summary = await run<PortfolioSnapshot>(registry, 'portfolio.summary', {}, ctx.now);
-  if (!summary || typeof summary.totalAssets !== 'number' || summary.totalAssets <= 0) return null;
+  if (!summary || typeof summary.totalAssets !== 'number' || !Number.isFinite(summary.totalAssets) || summary.totalAssets < 0) return null;
   const current = summary.totalAssets;
   const snapshot = await ctx.getRuleSnapshot(rule.id);
   const peak = snapshot.peakValue;
-  if (peak === undefined || current > peak) {
+  if (peak === undefined || !Number.isFinite(peak) || peak <= 0 || current > peak) {
+    // Zero is a valid drawdown endpoint, but cannot be the denominator.
+    if (current === 0) return null;
     // First observation or a new high-water mark — persist the peak, no drawdown.
     await ctx.patchRuleSnapshot(rule.id, { peakValue: current });
     return null;
