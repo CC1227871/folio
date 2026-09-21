@@ -53,6 +53,14 @@ class FakePiProcess extends EventEmitter {
         success: true,
         data: { sessionId: 'rt-1', thinkingLevel: 'off', isStreaming: false },
       })}\n`);
+    } else if (line.type === 'get_entries') {
+      this.stdout.write(`${JSON.stringify({
+        id: line.id,
+        type: 'response',
+        command: 'get_entries',
+        success: true,
+        data: { entries: [], leafId: null },
+      })}\n`);
     } else if (line.type === 'prompt') {
       this.stdout.write(`${JSON.stringify({ id: line.id, type: 'response', command: 'prompt', success: true })}\n`);
       this.stdout.write(`${JSON.stringify({ type: 'agent_end', messages: [] })}\n`);
