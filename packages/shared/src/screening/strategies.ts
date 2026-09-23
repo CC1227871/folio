@@ -184,7 +184,10 @@ function statementAccounts(report: FinancialReport | undefined, kind: 'IS' | 'BS
 function latestAccountValue(accounts: ReportAccount[], field: string): number | undefined {
   const account = accounts.find((entry) => entry.field === field)
   if (!account) return undefined
-  return account.values[0]?.value ?? account.values[account.values.length - 1]?.value
+  // Values are newest-first: the latest *reported* number is the first one with
+  // a usable value. Never fall back to the array tail — that is the oldest
+  // period and would report stale financials as the latest figures.
+  return account.values.find((entry) => entry.value !== undefined)?.value
 }
 
 function latestAccountYoy(accounts: ReportAccount[], field: string): number | undefined {
@@ -296,10 +299,15 @@ const highVolume: ScreeningStrategyDef = {
       ? [...ctx.data.kline].sort((a, b) => a.timestamp - b.timestamp).map((bar) => toFiniteNumber(bar.volume))
       : []
     const klineRatio = (() => {
-      const finite = barVolumes.filter((value): value is number => value !== undefined)
-      if (finite.length <= BREAKOUT_WINDOW) return undefined
-      const today = finite[finite.length - 1]
-      const baseline = finite.slice(-BREAKOUT_WINDOW - 1, -1)
+      // "Today" must be the actual latest bar by timestamp. Filtering out
+      // unknown volumes first would shift the index and mislabel yesterday's
+      // volume as today's, so the latest bar's volume is required to be known.
+      const today = barVolumes[barVolumes.length - 1]
+      if (today === undefined) return undefined
+      const baseline = barVolumes
+        .slice(-BREAKOUT_WINDOW - 1, -1)
+        .filter((value): value is number => value !== undefined)
+      if (baseline.length < BREAKOUT_WINDOW) return undefined
       const avg = baseline.reduce((acc, value) => acc + value, 0) / baseline.length
       if (avg === 0) return undefined
       return today / avg

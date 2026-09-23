@@ -115,12 +115,20 @@ export async function runAutomation(
     const material = signalsAreMaterial(evaluation.signals)
     if (material) {
       materialChanges += 1
-      analyzed += 1
-      await ctx.researchStart(symbol, rule.strategyId)
+      try {
+        await ctx.researchStart(symbol, rule.strategyId)
+        analyzed += 1
+      } catch {
+        failures.push(`${symbol}: research analysis failed`)
+      }
     }
     if (rule.notify === 'all' || material) {
-      await ctx.notify?.(notificationFor(rule, symbol, material, evaluation.signals, ranAt, ctx.locale))
-      notified = true
+      try {
+        await ctx.notify?.(notificationFor(rule, symbol, material, evaluation.signals, ranAt, ctx.locale))
+        notified = true
+      } catch {
+        failures.push(`${symbol}: notification failed`)
+      }
     }
   }
 
@@ -253,10 +261,15 @@ async function fetchQuote(symbol: string, ctx: AutomationRunContext): Promise<Qu
 }
 
 /**
- * Calendar probe: a `report`/`financial` event dated on/before today means an
- * earnings announcement the research diff may not cover yet. Degrades to
- * no-signal when the capability is absent or the call fails.
+ * Calendar probe: a `report`/`financial` event dated within the last 7 days
+ * means an earnings announcement the research diff may not cover yet. Without
+ * the freshness lower bound, any historical event still sitting in the "recent
+ * 5" list kept `earningsAnnounced` true forever, re-triggering research and
+ * notifications every single day (#168). Degrades to no-signal when the
+ * capability is absent or the call fails.
  */
+const EARNINGS_PROBE_WINDOW_SECONDS = 7 * 86_400;
+
 async function calendarProbe(symbol: string, ctx: AutomationRunContext): Promise<boolean> {
   const cap = ctx.registry.get('research.events')
   if (!cap) return false
@@ -268,7 +281,10 @@ async function calendarProbe(symbol: string, ctx: AutomationRunContext): Promise
     const events = result.data as CalendarEvent[]
     const nowSeconds = (ctx.now?.() ?? Date.now()) / 1000
     return events.some(
-      (event) => (event.type === 'report' || event.type === 'financial') && event.date <= nowSeconds
+      (event) =>
+        (event.type === 'report' || event.type === 'financial') &&
+        event.date <= nowSeconds &&
+        event.date > nowSeconds - EARNINGS_PROBE_WINDOW_SECONDS
     )
   } catch {
     return false
